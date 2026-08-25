@@ -21,10 +21,15 @@ import org.mockito.{ArgumentMatchersSugar, Mockito}
 import org.mockito.Mockito.{atLeastOnce, doNothing, never, times, verify, when}
 import org.mockito.invocation.InvocationOnMock
 import org.mockito.stubbing.Answer
+import org.opensearch.{OpenSearchException, OpenSearchSecurityException}
+import org.opensearch.action.DocWriteRequest.OpType
+import org.opensearch.action.bulk.{BulkItemResponse, BulkResponse}
+import org.opensearch.action.bulk.BulkItemResponse.Failure
 import org.opensearch.action.get.GetResponse
 import org.opensearch.flint.common.model.{FlintStatement, InteractiveSession, SessionStates}
 import org.opensearch.flint.common.scheduler.model.LangType
-import org.opensearch.flint.core.storage.{FlintReader, OpenSearchReader, OpenSearchUpdater}
+import org.opensearch.flint.core.storage.{FlintReader, OpenSearchBulkWriteException, OpenSearchReader, OpenSearchUpdater}
+import org.opensearch.rest.RestStatus
 import org.opensearch.search.sort.SortOrder
 import org.scalatest.prop.TableDrivenPropertyChecks._
 import org.scalatestplus.mockito.MockitoSugar
@@ -586,7 +591,7 @@ class FlintREPLTest
     val expectedError = (
       """{"message":"Fail to read data from Glue. Cause: Access denied in AWS Glue service. Please check permissions. (Service: AWSGlue; """ +
         """Status Code: 400; Error Code: AccessDeniedException; Request ID: null; Proxy: null)",""" +
-        """"ErrorSource":"AWSGlue","statusCode":"400","exception.type":"com.amazonaws.services.glue.model.AccessDeniedException"}"""
+        """"ErrorSource":"AWSGlue","statusCode":"400","errorCode":"GLUE_ACCESS_DENIED","exception.type":"com.amazonaws.services.glue.model.AccessDeniedException"}"""
     )
 
     val result = FlintREPL.processQueryException(exception, mockFlintStatement)
@@ -609,11 +614,78 @@ class FlintREPLTest
     val result = FlintREPL.processQueryException(exception, mockFlintCommand)
 
     val expectedError =
-      """{"message":"Fail to run query. Cause: Access denied in AWS Glue service. Please check permissions.","exception.type":"java.lang.SecurityException"}"""
+      """{"message":"Fail to run query. Cause: Access denied in AWS Glue service. Please check permissions.","errorCode":"UNKNOWN_ERROR","exception.type":"java.lang.SecurityException"}"""
 
     result shouldEqual expectedError
     verify(mockFlintCommand).fail()
     verify(mockFlintCommand).error = Some(expectedError)
+  }
+
+  // Contract test for temporary legacy downstream compatibility.
+  //
+  // Existing error translations may key this failure on two things: an exact exception.type of
+  // java.lang.RuntimeException and this message regex:
+  //   .*type=security_exception,\s*reason=OpenSearch exception\s*\[type=authorization_exception.*
+  // This test pins both on the persisted wire record so a future change that "cleans up" the
+  // concrete class name or compatibility token fails in CI instead of silently bypassing those
+  // translations. The durable contract is the structured errorCode/statusCode fields; remove this
+  // test with the temporary shim once downstream consumers use those fields.
+  test("processQueryException keeps legacy wire compatibility for a bulk-write auth failure") {
+    val forbidden = new BulkItemResponse(
+      0,
+      OpType.INDEX,
+      new Failure(
+        "myindex",
+        "doc-1",
+        new OpenSearchSecurityException("no permissions"),
+        RestStatus.FORBIDDEN))
+    val bulkWriteException = OpenSearchBulkWriteException.from(
+      "myindex",
+      new BulkResponse(Array(forbidden), 100L),
+      _ => true)
+
+    val mockFlintStatement = mock[FlintStatement]
+    val result = FlintREPL.processQueryException(bulkWriteException, mockFlintStatement)
+
+    // Structured, forward-looking contract: the durable classification.
+    result should include(""""errorCode":"OPENSEARCH_WRITE_ACCESS_DENIED"""")
+    result should include(""""statusCode":"403"""")
+    // Temporary downstream compatibility: the concrete class name is not on the wire.
+    result should include(""""exception.type":"java.lang.RuntimeException"""")
+    result should not include "OpenSearchBulkWriteException"
+
+    // Exact reproduction of the legacy translation match: exact RuntimeException type plus the
+    // canonical security/authorization sequence. This is intentionally stricter than checking for
+    // status 403 or either token independently.
+    val legacyExceptionTypeMatch = """"exception\.type":"java\.lang\.RuntimeException"""".r
+    val legacyAuthorizationTokenMatch =
+      """.*type=security_exception,\s*reason=OpenSearch exception\s*\[type=authorization_exception.*""".r
+    legacyExceptionTypeMatch.findFirstIn(result) shouldBe defined
+    legacyAuthorizationTokenMatch.findFirstIn(result) shouldBe defined
+  }
+
+  test("processQueryException does not translate a cluster-block 403 as access denied") {
+    val blocked = new BulkItemResponse(
+      0,
+      OpType.INDEX,
+      new Failure(
+        "myindex",
+        "doc-1",
+        new OpenSearchException(
+          "OpenSearch exception [type=cluster_block_exception, reason=index read-only]"),
+        RestStatus.FORBIDDEN))
+    val bulkWriteException = OpenSearchBulkWriteException.from(
+      "myindex",
+      new BulkResponse(Array(blocked), 100L),
+      _ => true)
+
+    val result = FlintREPL.processQueryException(bulkWriteException, mock[FlintStatement])
+
+    result should include(""""statusCode":"403"""")
+    result should include(""""errorCode":"OPENSEARCH_WRITE_ERROR"""")
+    result should include("type=cluster_block_exception")
+    result should not include "type=authorization_exception"
+    result should not include "reason=OpenSearch exception"
   }
 
   // A logical plan whose rendered string carries identifiable "customer" query content -- column
@@ -810,9 +882,12 @@ class FlintREPLTest
   }
 
   test(
-    "processQueryException should strip embedded newlines from SparkException messages with stack-trace-like content") {
+    "processQueryException redacts a SparkException to its errorClass, dropping the rendered message") {
     val mockFlintStatement = mock[FlintStatement]
 
+    // A bare SparkException carries no error class; its rendered message -- including the first
+    // line -- can interpolate literals, so the whole message is dropped rather than kept first-line.
+    // The structured errorCode channel still classifies it as a Spark query error.
     val sparkErrorWithEmbeddedDetails =
       "Job aborted due to stage failure: Task 0 in stage 1.0 failed\n" +
         "\tat org.apache.spark.scheduler.DAGScheduler.org\n" +
@@ -821,12 +896,14 @@ class FlintREPLTest
 
     val result = FlintREPL.processQueryException(exception, mockFlintStatement)
 
-    // Anything after the first \n must be dropped - internal frames may carry literals.
+    // No part of the rendered message survives -- not the embedded frames, and not the first line.
     result should not include "DAGScheduler"
     result should not include "secret-token-abc123"
-    // First line (human-readable summary) is preserved.
+    result should not include "Job aborted due to stage failure"
+    // The failure stays identifiable via the prefix and the structured classification.
     result should include("Spark exception. Cause:")
-    result should include("Job aborted due to stage failure")
+    result should include("[SPARK_ERROR]")
+    result should include(""""errorCode":"SPARK_QUERY_ERROR"""")
   }
 
   test(
