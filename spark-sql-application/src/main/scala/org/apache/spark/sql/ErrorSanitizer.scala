@@ -146,13 +146,19 @@ object ErrorSanitizer extends Logging {
    *
    * Per-family policy:
    *   - [[AnalysisException]] (including `ExtendedAnalysisException` and `ParseException`):
-   *     `getSimpleMessage`, which Spark documents as the diagnostic without the appended logical
-   *     plan or raw SQL.
+   *     treated as any other [[SparkThrowable]] below. Only the stable `errorClass` and, when
+   *     present, the `sqlState` are emitted. `getMessage`, `getSimpleMessage`, the attached
+   *     `QueryContext`, and the message parameters are never read: each of those interpolates
+   *     customer query content (the offending column, table, view, and alias names; the "Did you
+   *     mean" suggestions; the line and position text; the appended logical plan; and the raw `==
+   *     SQL ==` fragment). A hand-built analysis exception that carries no catalog `errorClass`
+   *     therefore reduces to a bare `[SPARK_ERROR]` label rather than recovering any token from
+   *     its free-text message.
    *   - [[OpenSearchBulkWriteException]]: its own message, which is assembled from structured
    *     fields and never includes per-item failure text.
    *   - [[AmazonS3Exception]]: structured service/status/error-code fields rather than the raw
    *     message, matching the policy already applied in `ExceptionMessages.redactMessage`.
-   *   - [[SparkThrowable]] (other than [[AnalysisException]]): only the stable `errorClass`
+   *   - [[SparkThrowable]] (all other Spark-native failures): only the stable `errorClass`
    *     identifier and, when present, the `sqlState`. Neither `getMessage` nor the message
    *     parameters are read: the rendered message interpolates parameter values (literals,
    *     identifiers, paths, and the appended `== SQL ==` query fragment), so any of it can carry
@@ -188,7 +194,6 @@ object ErrorSanitizer extends Logging {
   }
 
   private def policyMessage(t: Throwable): String = t match {
-    case ae: AnalysisException => ae.getSimpleMessage
     case be: OpenSearchBulkWriteException => openSearchBulkWriteMessage(be)
     case s3: AmazonS3Exception =>
       s"serviceName=[${s3.getServiceName}], statusCode=[${s3.getStatusCode}], " +
@@ -218,13 +223,15 @@ object ErrorSanitizer extends Logging {
   }
 
   /**
-   * For a [[SparkThrowable]] that is not an [[AnalysisException]], emit only the stable
-   * `errorClass` and, when present, the `sqlState`. `getMessage` is never called and message
-   * parameters are never read: both interpolate customer values (literals, identifiers, paths,
-   * and the `== SQL ==` query fragment). `errorClass` and `sqlState` come from Spark's
-   * error-conditions catalog and carry no query content. A throwable that reports no `errorClass`
-   * (legacy, non-catalog Spark failures) yields a bare label so nothing derived from the message
-   * leaks.
+   * For any [[SparkThrowable]] (including [[AnalysisException]], `ExtendedAnalysisException`, and
+   * [[ParseException]]), emit only the stable `errorClass` and, when present, the `sqlState`.
+   * `getMessage`/`getSimpleMessage` are never called and message parameters are never read: all
+   * of them interpolate customer values (literals, identifiers, the offending column/table/view
+   * names, the "Did you mean" suggestions, line/position text, and the `== SQL ==` query
+   * fragment). `errorClass` and `sqlState` come from Spark's error-conditions catalog and carry
+   * no query content. A throwable that reports no `errorClass` (legacy, non-catalog Spark
+   * failures, or a hand-built analysis exception) yields a bare label so nothing derived from the
+   * message leaks.
    */
   private def sparkThrowableMessage(st: SparkThrowable): String = {
     val label = Option(st.getErrorClass).filter(_.nonEmpty).getOrElse("SPARK_ERROR")

@@ -277,23 +277,34 @@ class ErrorSanitizerTest extends SparkFunSuite with Matchers {
     ErrorSanitizer.sanitizedMessage(e) shouldBe "[SPARK_ERROR]"
   }
 
-  test("sanitizedMessage uses getSimpleMessage for an analysis exception, dropping the plan") {
+  test(
+    "sanitizedMessage reduces a hand-built analysis exception to a bare label, recovering no " +
+      "token from its free-text message") {
     val planMarker = "480909524268"
     val plan = LocalRelation(AttributeReference(s"recipientAccountId_$planMarker", StringType)())
+    // A hand-built ExtendedAnalysisException carries no catalog errorClass, so getErrorClass is
+    // null. The strict policy must fall back to a bare label rather than parsing tokens (e.g. the
+    // bracketed "[UNRESOLVED_COLUMN]") out of the free-text message or reading getSimpleMessage.
     val e = new ExtendedAnalysisException(
       message = "[UNRESOLVED_COLUMN] cannot resolve `arn`",
       line = Some(1),
       startPosition = Some(295),
       plan = Some(plan))
 
-    // Precondition: the raw message really does leak the plan.
+    // Precondition: the raw message really does leak the plan and query-derived identifiers.
     e.getMessage should include(planMarker)
+    e.getMessage should include("arn")
 
     val sanitized = ErrorSanitizer.sanitizedMessage(e)
 
-    sanitized shouldBe e.getSimpleMessage
+    sanitized shouldBe "[SPARK_ERROR]"
+    // Nothing derived from the free-text message survives: not the bracketed pseudo-errorClass,
+    // not the offending identifier, not the plan, not the line/position text.
+    sanitized should not include "UNRESOLVED_COLUMN"
+    sanitized should not include "arn"
     sanitized should not include planMarker
     sanitized should not include "LocalRelation"
+    sanitized should not include "pos 295"
   }
 
   test("sanitizedMessage fails closed when policy evaluation itself throws") {

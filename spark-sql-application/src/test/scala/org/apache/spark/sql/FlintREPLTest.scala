@@ -709,12 +709,16 @@ class FlintREPLTest
     s should not include "LocalRelation"
   }
 
-  test("processQueryException should strip the logical plan from an ExtendedAnalysisException") {
+  test(
+    "processQueryException reduces a hand-built ExtendedAnalysisException to a bare label, " +
+      "leaking neither the plan nor any free-text token") {
     val mockFlintStatement = mock[FlintStatement]
 
     // ExtendedAnalysisException is the analysis-failure type whose
     //   getMessage = getSimpleMessage + ";\n" + plan.toString
-    // appends the logical plan tree (which carries customer query content).
+    // appends the logical plan tree (which carries customer query content). This hand-built
+    // instance carries no catalog errorClass, so the strict policy must emit a bare label rather
+    // than recovering the bracketed pseudo-errorClass or the suggestion text from the message.
     val plan = customerPlan()
     val exception = new ExtendedAnalysisException(
       message = "[UNRESOLVED_COLUMN.WITH_SUGGESTION] A column or function parameter with name " +
@@ -729,13 +733,20 @@ class FlintREPLTest
 
     val result = FlintREPL.processQueryException(exception, mockFlintStatement)
 
-    // The plan tree MUST be gone.
+    // The plan tree MUST be gone ...
     assertNoPlanContent(result)
-    // The diagnostic (error class, suggestion, position) MUST be preserved so customers can fix it.
+    // ... and so must every free-text token: no pseudo-errorClass, no suggestion, no position.
+    result should not include "UNRESOLVED_COLUMN.WITH_SUGGESTION"
+    result should not include "Did you mean one of the following?"
+    result should not include "cannot be resolved"
+    result should not include "line 1 pos 295"
+    // The failure stays identifiable via the analysis prefix, the bare label, and the structured
+    // classification, all of which are independent of the message wording.
     result should include("Fail to analyze query. Cause:")
-    result should include("UNRESOLVED_COLUMN.WITH_SUGGESTION")
-    result should include("Did you mean one of the following?")
-    result should include("line 1 pos 295")
+    result should include("[SPARK_ERROR]")
+    result should include(""""errorCode":"QUERY_ANALYSIS_ERROR"""")
+    result should include(
+      "\"exception.type\":\"org.apache.spark.sql.catalyst.ExtendedAnalysisException\"")
 
     verify(mockFlintStatement).fail()
     verify(mockFlintStatement).error = Some(result)
@@ -764,13 +775,12 @@ class FlintREPLTest
     result should not include "RedactedException"
   }
 
-  test(
-    "processQueryException redacts the reported CloudWatch plan leak but keeps the diagnostic") {
+  test("processQueryException redacts the reported CloudWatch plan leak down to a bare label") {
     // Reproduces the exact reported leak: an ExtendedAnalysisException whose getMessage appends a
     // resolved logical plan carrying customer values (account id, ARN, and the filter literals from
-    // the user's WHERE clause). The fix must drop the whole plan tree (everything after ";\n") yet
-    // keep the human-readable analysis diagnostic, including the column names, so the error stays
-    // debuggable without the filter values.
+    // the user's WHERE clause). The strict policy drops the whole plan tree AND the free-text
+    // diagnostic (which itself embeds the customer alias/column names), leaving only the bare
+    // label plus the structured classification.
     val mockFlintStatement = mock[FlintStatement]
 
     // Column refs whose names embed the (fake) account id and ARN, plus the filter literals that
@@ -796,28 +806,34 @@ class FlintREPLTest
 
     val result = FlintREPL.processQueryException(exception, mockFlintStatement)
 
-    // Redacted (not removed): the plan and every customer value it carried are gone ...
+    // The plan and every customer value it carried are gone ...
     result should not include "480909524268"
     result should not include "471112993047"
     result should not include filterValue
     result should not include "Filter"
     result should not include "LocalRelation"
-    // ... but the diagnostic the team wants to keep for debugging survives intact.
+    // ... as is the free-text diagnostic, which embedded the customer alias and column names.
+    result should not include "UNRESOLVED_COLUMN.WITH_SUGGESTION"
+    result should not include "_CWLBasic_Alias"
+    result should not include "cannot be resolved"
+    result should not include "Did you mean one of the following?"
+    result should not include "line 1 pos 295"
+    // What survives is stable and non-customer.
     result should include("Fail to analyze query. Cause:")
-    result should include("UNRESOLVED_COLUMN.WITH_SUGGESTION")
-    result should include("cannot be resolved")
-    result should include("Did you mean one of the following?")
-    result should include("line 1 pos 295")
+    result should include("[SPARK_ERROR]")
+    result should include(""""errorCode":"QUERY_ANALYSIS_ERROR"""")
     result should include(
       "\"exception.type\":\"org.apache.spark.sql.catalyst.ExtendedAnalysisException\"")
   }
 
   test(
-    "processQueryException should strip the SQL text from a ParseException (== SQL == block)") {
+    "processQueryException reduces a hand-built ParseException to a bare label, dropping the SQL text") {
     val mockFlintStatement = mock[FlintStatement]
 
     // ParseException.getMessage embeds the raw SQL command in a "== SQL ==" block. The command is
-    // the verbatim customer query and must not be persisted.
+    // the verbatim customer query and must not be persisted. A hand-built ParseException carries no
+    // catalog errorClass, so the strict policy emits a bare label and recovers nothing from the
+    // free-text diagnostic either.
     val customerSql =
       "SELECT * FROM logs WHERE arn LIKE '%example-secret-bucket%' SYNTAX_ERROR_HERE"
     val origin = Origin(line = Some(1), startPosition = Some(60))
@@ -833,13 +849,16 @@ class FlintREPLTest
 
     val result = FlintREPL.processQueryException(exception, mockFlintStatement)
 
-    // The SQL text and the == SQL == block MUST be gone.
+    // The SQL text, the == SQL == block, and the free-text diagnostic MUST be gone.
     result should not include "example-secret-bucket"
     result should not include "== SQL =="
     result should not include "SELECT * FROM logs"
-    // The human-readable syntax diagnostic MUST be preserved.
-    result should include("Syntax error")
-    result should include("Syntax error at or near 'SYNTAX_ERROR_HERE'")
+    result should not include "SYNTAX_ERROR_HERE"
+    result should not include "Syntax error at or near"
+    // The failure stays identifiable via the syntax prefix, the bare label, and the classification.
+    result should include("Syntax error:")
+    result should include("[SPARK_ERROR]")
+    result should include(""""errorCode":"QUERY_SYNTAX_ERROR"""")
   }
 
   test(
@@ -859,14 +878,18 @@ class FlintREPLTest
     val result = FlintREPL.processQueryException(wrapper, mockFlintStatement)
 
     assertNoPlanContent(result)
-    result should include("UNRESOLVED_COLUMN")
+    result should not include "UNRESOLVED_COLUMN"
+    result should include("[SPARK_ERROR]")
+    result should include(""""errorCode":"QUERY_ANALYSIS_ERROR"""")
   }
 
   test(
-    "processQueryException should keep an AnalysisException whose message has newlines but no plan (getSimpleMessage, plan = None)") {
+    "processQueryException reduces an AnalysisException with no plan to a bare label, dropping the free-text message") {
     val mockFlintStatement = mock[FlintStatement]
 
-    // ExtendedAnalysisException with plan = None: getMessage == getSimpleMessage, no plan annotation.
+    // ExtendedAnalysisException with plan = None: getMessage == getSimpleMessage. Even here the
+    // message can name a customer table, so with no catalog errorClass the strict policy emits a
+    // bare label rather than the free text.
     val exception = new ExtendedAnalysisException(
       message = "Table or view not found: my_table",
       line = Some(2),
@@ -876,8 +899,11 @@ class FlintREPLTest
     val result = FlintREPL.processQueryException(exception, mockFlintStatement)
 
     result should include("Fail to analyze query. Cause:")
-    result should include("Table or view not found: my_table")
-    result should include("line 2 pos 5")
+    result should include("[SPARK_ERROR]")
+    result should include(""""errorCode":"QUERY_ANALYSIS_ERROR"""")
+    result should not include "Table or view not found: my_table"
+    result should not include "my_table"
+    result should not include "line 2 pos 5"
     assertNoPlanContent(result)
   }
 
@@ -1014,7 +1040,7 @@ class FlintREPLTest
   // ---- Direct unit tests for the redaction helpers (FlintJobExecutor via the FlintREPL object) ----
 
   test(
-    "sanitizedMessage uses getSimpleMessage for ExtendedAnalysisException, dropping the plan") {
+    "sanitizedMessage reduces a hand-built ExtendedAnalysisException to a bare label, dropping the plan") {
     val plan = customerPlan()
     val exception = new ExtendedAnalysisException(
       message = "[UNRESOLVED_COLUMN] cannot resolve `arn`",
@@ -1024,15 +1050,18 @@ class FlintREPLTest
 
     val sanitized = FlintREPL.sanitizedMessage(exception)
 
-    sanitized shouldBe exception.getSimpleMessage
-    sanitized should include("UNRESOLVED_COLUMN")
-    sanitized should include("line 1 pos 295")
+    // No catalog errorClass => bare label; nothing is recovered from the free-text message.
+    sanitized shouldBe "[SPARK_ERROR]"
+    sanitized should not include "UNRESOLVED_COLUMN"
+    sanitized should not include "arn"
+    sanitized should not include "line 1 pos 295"
     assertNoPlanContent(sanitized)
     // The raw getMessage carries the plan; sanitizedMessage must be strictly shorter / different.
     sanitized should not equal exception.getMessage
   }
 
-  test("sanitizedMessage uses getSimpleMessage for ParseException, dropping the SQL text") {
+  test(
+    "sanitizedMessage reduces a hand-built ParseException to a bare label, dropping the SQL text") {
     val customerSql = "SELECT secret_col FROM t WHERE x LIKE '%example-secret%' BADTOKEN"
     val origin = Origin(line = Some(1), startPosition = Some(40))
     val exception = new ParseException(
@@ -1043,8 +1072,10 @@ class FlintREPLTest
 
     val sanitized = FlintREPL.sanitizedMessage(exception)
 
-    sanitized shouldBe exception.getSimpleMessage
-    sanitized should include("Syntax error at or near 'BADTOKEN'")
+    // No catalog errorClass => bare label; the free-text diagnostic and SQL are both gone.
+    sanitized shouldBe "[SPARK_ERROR]"
+    sanitized should not include "Syntax error at or near"
+    sanitized should not include "BADTOKEN"
     sanitized should not include "example-secret"
     sanitized should not include "== SQL =="
     sanitized should not include "secret_col"
@@ -1079,8 +1110,9 @@ class FlintREPLTest
 
     // getMessage / getLocalizedMessage / toString must never expose the plan -- these are the
     // exact accessors CustomLogging (exception.message attribute) and log4j (stack-trace header)
-    // read from.
-    redacted.getMessage shouldBe original.getSimpleMessage
+    // read from. The sanitized message is the errorClass-only bare label (no catalog errorClass on
+    // this hand-built instance), not getSimpleMessage.
+    redacted.getMessage shouldBe "[SPARK_ERROR]"
     assertNoPlanContent(redacted.getMessage)
     assertNoPlanContent(redacted.getLocalizedMessage)
     assertNoPlanContent(redacted.toString)
