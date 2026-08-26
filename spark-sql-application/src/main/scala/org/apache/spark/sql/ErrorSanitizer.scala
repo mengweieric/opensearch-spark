@@ -22,30 +22,30 @@ import org.apache.spark.sql.catalyst.parser.ParseException
  * wording.
  *
  * Rationale for splitting the two: an error string that is simultaneously the human-readable
- * diagnostic and the classification protocol cannot be changed safely. Redacting it for compliance
- * alters the classification; preserving it for classification blocks redaction. Emitting
- * [[classify]] alongside [[sanitizedMessage]] lets the message be rewritten freely while
+ * diagnostic and the classification protocol cannot be changed safely. Redacting it for
+ * compliance alters the classification; preserving it for classification blocks redaction.
+ * Emitting [[classify]] alongside [[sanitizedMessage]] lets the message be rewritten freely while
  * classification stays stable.
  *
- * Policies are per exception family because there is no single textual rule that is safe for every
- * message. Each family below is handled by what its type actually guarantees, and anything
+ * Policies are per exception family because there is no single textual rule that is safe for
+ * every message. Each family below is handled by what its type actually guarantees, and anything
  * unrecognized falls back to the most conservative option that does not regress the currently
  * shipped behavior.
  */
 object ErrorSanitizer extends Logging {
 
   /**
-   * Message used when the sanitizer itself fails. Deliberately carries no detail from the original
-   * throwable beyond its type: if policy evaluation threw, we cannot assert anything about what the
-   * original message contains, so returning it would be fail-open.
+   * Message used when the sanitizer itself fails. Deliberately carries no detail from the
+   * original throwable beyond its type: if policy evaluation threw, we cannot assert anything
+   * about what the original message contains, so returning it would be fail-open.
    */
   private[sql] val RedactedFallbackMessage = "error details were redacted"
 
   /**
    * Closed vocabulary of error codes. A fixed enumeration is what makes this channel trustworthy:
    * nothing is interpolated into it, so it provably carries no customer content, and adding or
-   * changing a value is an explicit, reviewable API change rather than an incidental side effect of
-   * editing a message string.
+   * changing a value is an explicit, reviewable API change rather than an incidental side effect
+   * of editing a message string.
    */
   object ErrorCode {
     val QuerySyntaxError = "QUERY_SYNTAX_ERROR"
@@ -66,15 +66,15 @@ object ErrorSanitizer extends Logging {
    *   a value from [[ErrorCode]]
    * @param statusCode
    *   HTTP status when the failure carries one on a typed field, otherwise None. Never parsed out
-   *   of message text: a status recovered by regex from a string we also rewrite would reintroduce
-   *   the coupling this class exists to remove.
+   *   of message text: a status recovered by regex from a string we also rewrite would
+   *   reintroduce the coupling this class exists to remove.
    */
   case class ErrorClassification(errorCode: String, statusCode: Option[Int])
 
   /**
    * Classifies a throwable using typed fields only. Callers are expected to have unwrapped to the
-   * root cause already; this additionally walks the cause chain so a wrapped typed failure is still
-   * recognized.
+   * root cause already; this additionally walks the cause chain so a wrapped typed failure is
+   * still recognized.
    *
    * Specific failures win over generic ones regardless of nesting depth. A write or connector
    * failure surfaces to the driver wrapped in a task-failure [[SparkException]], so matching the
@@ -161,18 +161,18 @@ object ErrorSanitizer extends Logging {
    *   - Anything else, including other AWS exceptions: the first line only.
    *
    * Other AWS families deliberately keep their first line rather than being reduced to structured
-   * fields. Their message is frequently already a curated, safe sentence -- `processQueryException`
-   * replaces a Glue access-denied message with an actionable explanation -- and reducing it to an
-   * error code would discard that. Broadening redaction there changes text that downstream
-   * consumers may classify on, so it belongs in its own reviewed change rather than riding along
-   * with this one.
+   * fields. Their message is frequently already a curated, safe sentence --
+   * `processQueryException` replaces a Glue access-denied message with an actionable explanation
+   * -- and reducing it to an error code would discard that. Broadening redaction there changes
+   * text that downstream consumers may classify on, so it belongs in its own reviewed change
+   * rather than riding along with this one.
    *
-   * On the final case: the stricter option is a type plus a generic message, and that is the right
-   * end state. It is not enabled yet because consumers still classify some failures by matching
-   * message text, so replacing every unrecognized message with a constant would break more
-   * classifications than it protects. Keeping the first line holds the current behavior while the
-   * structured [[classify]] channel is adopted; it is a floor, not a guarantee, since a single-line
-   * message can still contain customer values.
+   * On the final case: the stricter option is a type plus a generic message, and that is the
+   * right end state. It is not enabled yet because consumers still classify some failures by
+   * matching message text, so replacing every unrecognized message with a constant would break
+   * more classifications than it protects. Keeping the first line holds the current behavior
+   * while the structured [[classify]] channel is adopted; it is a floor, not a guarantee, since a
+   * single-line message can still contain customer values.
    */
   def sanitizedMessage(t: Throwable): String = try {
     policyMessage(t)
@@ -198,12 +198,13 @@ object ErrorSanitizer extends Logging {
   }
 
   /**
-   * Returns the safe structured bulk-write message plus a temporary, canonical compatibility token
-   * for existing downstream authorization translations. The token is derived only from typed status
-   * and exception-name fields; no OpenSearch failure reason is copied. Legacy consumers may require
-   * the exact `type=security_exception, reason=OpenSearch exception [type=authorization_exception`
-   * shape in addition to `exception.type=java.lang.RuntimeException`. Remove this token together
-   * with the persisted-type shim once consumers classify on `errorCode` and `statusCode`.
+   * Returns the safe structured bulk-write message plus a temporary, canonical compatibility
+   * token for existing downstream authorization translations. The token is derived only from
+   * typed status and exception-name fields; no OpenSearch failure reason is copied. Legacy
+   * consumers may require the exact `type=security_exception, reason=OpenSearch exception
+   * [type=authorization_exception` shape in addition to
+   * `exception.type=java.lang.RuntimeException`. Remove this token together with the
+   * persisted-type shim once consumers classify on `errorCode` and `statusCode`.
    */
   private def openSearchBulkWriteMessage(be: OpenSearchBulkWriteException): String = {
     val message = firstLine(be.getMessage)
@@ -219,10 +220,11 @@ object ErrorSanitizer extends Logging {
   /**
    * For a [[SparkThrowable]] that is not an [[AnalysisException]], emit only the stable
    * `errorClass` and, when present, the `sqlState`. `getMessage` is never called and message
-   * parameters are never read: both interpolate customer values (literals, identifiers, paths, and
-   * the `== SQL ==` query fragment). `errorClass` and `sqlState` come from Spark's error-conditions
-   * catalog and carry no query content. A throwable that reports no `errorClass` (legacy,
-   * non-catalog Spark failures) yields a bare label so nothing derived from the message leaks.
+   * parameters are never read: both interpolate customer values (literals, identifiers, paths,
+   * and the `== SQL ==` query fragment). `errorClass` and `sqlState` come from Spark's
+   * error-conditions catalog and carry no query content. A throwable that reports no `errorClass`
+   * (legacy, non-catalog Spark failures) yields a bare label so nothing derived from the message
+   * leaks.
    */
   private def sparkThrowableMessage(st: SparkThrowable): String = {
     val label = Option(st.getErrorClass).filter(_.nonEmpty).getOrElse("SPARK_ERROR")

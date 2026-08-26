@@ -9,6 +9,8 @@ import java.util.Locale
 import java.util.concurrent.ThreadPoolExecutor
 import java.util.concurrent.atomic.AtomicInteger
 
+import scala.util.control.NonFatal
+
 import com.amazonaws.services.glue.model.{AccessDeniedException, AWSGlueException}
 import com.amazonaws.services.s3.model.AmazonS3Exception
 import com.fasterxml.jackson.databind.ObjectMapper
@@ -456,8 +458,9 @@ trait FlintJobExecutor {
   /**
    * Returns an exception's message with customer query content removed, for compliance.
    *
-   * Delegates to [[ErrorSanitizer]], which holds one policy per exception family plus a fail-closed
-   * fallback. Kept here as the historical entry point used by the catch sites and tests.
+   * Delegates to [[ErrorSanitizer]], which holds one policy per exception family plus a
+   * fail-closed fallback. Kept here as the historical entry point used by the catch sites and
+   * tests.
    */
   private[sql] def sanitizedMessage(t: Throwable): String = ErrorSanitizer.sanitizedMessage(t)
 
@@ -529,8 +532,23 @@ trait FlintJobExecutor {
   }
 
   def getRootCause(t: Throwable): Throwable = {
-    if (t.getCause == null) t
-    else getRootCause(t.getCause)
+    // Walk to the deepest cause, guarding against a cyclic chain (a throwable whose cause is
+    // itself, or a longer loop). This runs on the error-handling path, where a naive recursion
+    // would StackOverflow on such a chain and mask the original failure with a secondary error.
+    // Tail-recursive, so it compiles to a loop and does not grow the stack. Mirrors the
+    // cycle-safety already relied on by ErrorSanitizer.classify.
+    @scala.annotation.tailrec
+    def loop(current: Throwable, seen: Set[Throwable]): Throwable = {
+      // getCause runs on the error-handling path; a hostile throwable whose getCause() throws
+      // would otherwise propagate a secondary failure out of processQueryException and mask the
+      // original query error. Treat a throwing getCause() as "no further cause" and stop here.
+      val cause =
+        try current.getCause
+        catch { case NonFatal(_) => null }
+      if (cause == null || seen.contains(cause)) current
+      else loop(cause, seen + current)
+    }
+    loop(t, Set.empty)
   }
 
   /**
@@ -567,7 +585,14 @@ trait FlintJobExecutor {
         handleQueryException(r, ExceptionMessages.SparkExceptionErrorPrefix)
       case t: Throwable =>
         val rootCauseClassName = t.getClass.getName
-        val errMsg = t.getMessage
+        // Read the message defensively: this is the error-handling path, so a hostile throwable
+        // whose getMessage() throws must not propagate a secondary failure, and a MetaException
+        // with a null message must not NPE on the contains(...) check below (the MetaException
+        // class-name guard alone does not short-circuit a null errMsg). Fall back to "" in both
+        // cases, which routes to the generic redaction path.
+        val errMsg =
+          try Option(t.getMessage).getOrElse("")
+          catch { case NonFatal(_) => "" }
         if (rootCauseClassName == "org.apache.hadoop.hive.metastore.api.MetaException" &&
           errMsg.contains("com.amazonaws.services.glue.model.AccessDeniedException")) {
           val e = new SecurityException(ExceptionMessages.GlueAccessDeniedMessage)

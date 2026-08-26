@@ -90,6 +90,80 @@ class OpenSearchBulkWriteWireTest {
     assertFalse(error.getMessage().contains("customer-index"), error.getMessage());
   }
 
+  /**
+   * Real-server shape: an OpenSearch 2.6 security plugin returns {@code security_exception} with a
+   * plain reason (not the {@code authorization_exception}-wrapped form). The body below is the
+   * verbatim item error captured from a live security-enabled OpenSearch 2.6.0 bulk response when a
+   * read-only user attempts an index. It must still classify as a 403 access-denied write while the
+   * reason -- which names the requesting principal -- is dropped.
+   */
+  @Test
+  void realRestClientClassifiesPlainSecurityException403AsAccessDeniedWithoutThePrincipal()
+      throws Exception {
+    String principalReason =
+        "no permissions for [indices:data/write/index, indices:data/write/bulk[s]] and "
+            + "User [name=probeuser, backend_roles=[], requestedTenant=null]";
+    String responseBody = "{"
+        + "\"took\":3,"
+        + "\"errors\":true,"
+        + "\"items\":[{\"index\":{"
+        + "\"_index\":\"customer-index\","
+        + "\"_id\":\"doc-1\","
+        + "\"status\":403,"
+        + "\"error\":{"
+        + "\"type\":\"security_exception\","
+        + "\"reason\":\"" + principalReason + "\""
+        + "}}}]}";
+
+    OpenSearchBulkWriteException error = executeWireResponse(responseBody);
+
+    assertEquals(403, error.getStatusCode());
+    assertEquals(java.util.List.of("security_exception"), error.getExceptionTypeNames());
+    assertTrue(error.getMessage().contains("type=security_exception"), error.getMessage());
+    assertFalse(error.getMessage().contains("probeuser"), error.getMessage());
+    assertFalse(error.getMessage().contains("no permissions"), error.getMessage());
+    assertFalse(error.getMessage().contains("customer-index"), error.getMessage());
+  }
+
+  /**
+   * Real-server shape: a {@code mapper_parsing_exception} (HTTP 400) whose reason echoes the
+   * offending document field value, plus a nested {@code number_format_exception} that repeats it.
+   * The body below is the verbatim item error captured from a live OpenSearch 2.6.0 bulk response
+   * when a string is indexed into an integer field. It must classify as a non-authorization 400
+   * write error while every copy of the document value is dropped; only the closed-vocabulary type
+   * names survive.
+   */
+  @Test
+  void realRestClientClassifiesMapperParsing400AndDropsTheDocumentValue() throws Exception {
+    String documentValue = "MAPPARSE_CANARY_B2_not_a_number";
+    String responseBody = "{"
+        + "\"took\":12,"
+        + "\"errors\":true,"
+        + "\"items\":[{\"index\":{"
+        + "\"_index\":\"customer-index\","
+        + "\"_id\":\"doc-1\","
+        + "\"status\":400,"
+        + "\"error\":{"
+        + "\"type\":\"mapper_parsing_exception\","
+        + "\"reason\":\"failed to parse field [n] of type [integer] in document with id '1'. "
+        + "Preview of field's value: '" + documentValue + "'\","
+        + "\"caused_by\":{"
+        + "\"type\":\"number_format_exception\","
+        + "\"reason\":\"For input string: \\\"" + documentValue + "\\\"\""
+        + "}}}}]}";
+
+    OpenSearchBulkWriteException error = executeWireResponse(responseBody);
+
+    assertEquals(400, error.getStatusCode());
+    assertTrue(
+        error.getExceptionTypeNames().contains("mapper_parsing_exception"),
+        error.getExceptionTypeNames().toString());
+    assertTrue(error.getMessage().contains("type=mapper_parsing_exception"), error.getMessage());
+    assertFalse(error.getMessage().contains(documentValue), error.getMessage());
+    assertFalse(error.getMessage().contains("Preview of field"), error.getMessage());
+    assertFalse(error.getMessage().contains("customer-index"), error.getMessage());
+  }
+
   private static OpenSearchBulkWriteException executeWireResponse(String responseBody)
       throws Exception {
     try (SingleResponseServer server = new SingleResponseServer(responseBody);

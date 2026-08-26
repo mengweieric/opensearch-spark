@@ -938,6 +938,79 @@ class FlintREPLTest
     result should not include "Cause: null"
   }
 
+  // ---- Resilience of the error-handling path itself (DEFECT-1348) ----
+  // These pin that processQueryException never lets a hostile throwable turn error handling into a
+  // secondary, unhandled failure that masks the original query error. Synthetic CANARY_1348_ data
+  // only; no customer content.
+
+  test(
+    "processQueryException should not propagate a secondary failure when getMessage throws " +
+      "(DEFECT-1348-01, CANARY_1348_HOSTILE_GETMESSAGE_THROWS)") {
+    val mockFlintStatement = mock[FlintStatement]
+
+    // Hostile throwable whose getMessage() throws. The final `case t: Throwable` branch used to
+    // read `t.getMessage` unguarded, so this secondary exception propagated out of
+    // processQueryException and masked the original error.
+    val exception = new RuntimeException {
+      override def getMessage: String =
+        throw new RuntimeException("CANARY_1348_HOSTILE_GETMESSAGE_THROWS")
+    }
+
+    // Must complete without throwing and produce a parseable, redacted error record.
+    val result = FlintREPL.processQueryException(exception, mockFlintStatement)
+
+    result should include("Fail to run query. Cause:")
+    result should include("error details were redacted")
+    // The hostile canary from getMessage must never leak into the persisted error.
+    result should not include "CANARY_1348_HOSTILE_GETMESSAGE_THROWS"
+    verify(mockFlintStatement).fail()
+    verify(mockFlintStatement).error = Some(result)
+  }
+
+  test(
+    "processQueryException should not propagate a secondary failure when getCause throws " +
+      "(DEFECT-1348-02, CANARY_1348_HOSTILE_GETCAUSE_THROWS)") {
+    val mockFlintStatement = mock[FlintStatement]
+
+    // Hostile throwable whose getCause() throws. getRootCause's loop walked getCause unguarded, so
+    // this secondary exception propagated out of processQueryException before any redaction ran.
+    val exception = new RuntimeException("CANARY_1348_HOSTILE_GETCAUSE_OUTER") {
+      override def getCause: Throwable =
+        throw new RuntimeException("CANARY_1348_HOSTILE_GETCAUSE_THROWS")
+    }
+
+    val result = FlintREPL.processQueryException(exception, mockFlintStatement)
+
+    result should include("Fail to run query. Cause:")
+    // The outer single-line non-analysis message is retained per current policy (a floor).
+    result should include("CANARY_1348_HOSTILE_GETCAUSE_OUTER")
+    // The secondary getCause() failure canary must never surface.
+    result should not include "CANARY_1348_HOSTILE_GETCAUSE_THROWS"
+    verify(mockFlintStatement).fail()
+    verify(mockFlintStatement).error = Some(result)
+  }
+
+  test(
+    "processQueryException should handle a MetaException with a null message without throwing " +
+      "(DEFECT-1348-03, CANARY_1348_METAEX_NULL_MESSAGE)") {
+    val mockFlintStatement = mock[FlintStatement]
+
+    // Default ctor => null message. The class IS MetaException, so the Glue-access-denied guard's
+    // left operand is true and the short-circuit did not protect the null errMsg: `errMsg.contains`
+    // dereferenced null and NPE'd instead of falling through to the generic redaction path.
+    val exception = new org.apache.hadoop.hive.metastore.api.MetaException()
+
+    val result = FlintREPL.processQueryException(exception, mockFlintStatement)
+
+    result should include("Fail to run query. Cause:")
+    result should include(
+      "\"exception.type\":\"org.apache.hadoop.hive.metastore.api.MetaException\"")
+    // A null message must not surface the literal "null" string.
+    result should not include "Cause: null"
+    verify(mockFlintStatement).fail()
+    verify(mockFlintStatement).error = Some(result)
+  }
+
   // ---- Direct unit tests for the redaction helpers (FlintJobExecutor via the FlintREPL object) ----
 
   test(

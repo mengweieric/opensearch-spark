@@ -31,13 +31,11 @@ class ErrorSanitizerTest extends SparkFunSuite with Matchers {
 
   private def bulkWriteException(
       status: RestStatus,
-      cause: Exception = new OpenSearchSecurityException("no permissions")): OpenSearchBulkWriteException = {
+      cause: Exception = new OpenSearchSecurityException("no permissions"))
+      : OpenSearchBulkWriteException = {
     val item =
       new BulkItemResponse(0, OpType.INDEX, new Failure("myindex", "doc-1", cause, status))
-    OpenSearchBulkWriteException.from(
-      "myindex",
-      new BulkResponse(Array(item), 100L),
-      _ => true)
+    OpenSearchBulkWriteException.from("myindex", new BulkResponse(Array(item), 100L), _ => true)
   }
 
   // ---- classification ----
@@ -78,7 +76,9 @@ class ErrorSanitizerTest extends SparkFunSuite with Matchers {
   test("classify finds a typed failure wrapped inside a SparkException") {
     // Real shape: a write failure surfaces to the driver wrapped in a task-failure SparkException.
     val wrapped =
-      new SparkException("Job aborted due to stage failure", bulkWriteException(RestStatus.FORBIDDEN))
+      new SparkException(
+        "Job aborted due to stage failure",
+        bulkWriteException(RestStatus.FORBIDDEN))
 
     val classification = ErrorSanitizer.classify(wrapped)
 
@@ -97,7 +97,8 @@ class ErrorSanitizerTest extends SparkFunSuite with Matchers {
     classification.statusCode shouldBe Some(403)
   }
 
-  test("classify maps a Glue AccessDeniedException to access-denied even when the SDK status is 400") {
+  test(
+    "classify maps a Glue AccessDeniedException to access-denied even when the SDK status is 400") {
     // Glue reports authorization failures with the concrete AccessDeniedException type but an HTTP
     // status of 400, so the status alone would misclassify it as a generic Glue error.
     val glue = new com.amazonaws.services.glue.model.AccessDeniedException("denied")
@@ -122,7 +123,11 @@ class ErrorSanitizerTest extends SparkFunSuite with Matchers {
     val forbidden = new BulkItemResponse(
       0,
       OpType.INDEX,
-      new Failure("myindex", "doc-1", new OpenSearchSecurityException("denied"), RestStatus.FORBIDDEN))
+      new Failure(
+        "myindex",
+        "doc-1",
+        new OpenSearchSecurityException("denied"),
+        RestStatus.FORBIDDEN))
     val throttled = new BulkItemResponse(
       1,
       OpType.INDEX,
@@ -202,7 +207,8 @@ class ErrorSanitizerTest extends SparkFunSuite with Matchers {
     // processQueryException replaces a Glue access-denied message with an actionable explanation.
     // Reducing every AWS exception to an error code would throw that away, so other AWS families
     // keep their first line.
-    val glue = new AWSGlueException("Access denied in AWS Glue service. Please check permissions.")
+    val glue =
+      new AWSGlueException("Access denied in AWS Glue service. Please check permissions.")
     glue.setStatusCode(400)
     glue.setServiceName("AWSGlue")
 
