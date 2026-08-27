@@ -5,6 +5,9 @@
 
 package org.apache.spark.sql
 
+import scala.collection.JavaConverters._
+
+import com.fasterxml.jackson.databind.{JsonNode, ObjectMapper}
 import org.opensearch.flint.common.model.FlintStatement
 import org.opensearch.flint.core.logging.{CustomLogging, ExceptionMessages, OperationMessage}
 import org.scalatest.matchers.should.Matchers
@@ -197,5 +200,226 @@ class ErrorSanitizerRealSparkTest
     exceptionType shouldBe "org.apache.spark.sql.exception.RedactedException"
     // The original exception type is still recoverable from the rendered header for debugging.
     redacted.toString should include("ExtendedAnalysisException")
+  }
+
+  // --------------------------------------------------------------------------
+  // Production JSON serializer coverage + table-driven real-exception canary
+  // matrix.
+  //
+  // The tests above assert the intermediate field map. The tests below drive
+  // the exact string log4j receives -- CustomLogging.convertToJson applied to
+  // the map constructLogEventMap builds -- then parse that line and recursively
+  // scan every leaf value, so a canary that survived only after JSON escaping
+  // (a CRLF or Unicode canary) is still caught. The matrix provokes a broad set
+  // of real Spark 3.5.1 failures and routes each through the sanitizer, the
+  // full FlintREPL.processQueryException sink, and the production serializer.
+  // --------------------------------------------------------------------------
+
+  private val jsonMapper = new ObjectMapper()
+
+  /**
+   * The exact line log4j is handed: constructLogEventMap -> convertToJson, both reached by
+   * reflection. convertToJson is `private static` and is the only place the OTEL log map becomes
+   * the emitted string, so asserting on its output covers the serializer itself rather than just
+   * the map it serializes.
+   */
+  private def productionLogLine(content: Object, throwable: Throwable): String = {
+    val map = constructLogEventMap(content, throwable)
+    val method =
+      classOf[CustomLogging].getDeclaredMethod("convertToJson", classOf[java.util.Map[_, _]])
+    method.setAccessible(true)
+    method.invoke(null, map).asInstanceOf[String]
+  }
+
+  /** Every scalar leaf value in a JSON document, recursively. */
+  private def leafValues(node: JsonNode): Seq[String] = {
+    if (node.isObject) {
+      node.fields().asScala.toSeq.flatMap(e => leafValues(e.getValue))
+    } else if (node.isArray) {
+      node.elements().asScala.toSeq.flatMap(leafValues)
+    } else {
+      Seq(node.asText())
+    }
+  }
+
+  private def assertNoCanary(scope: String, text: String, canaries: Seq[String]): Unit =
+    canaries.foreach { canary =>
+      withClue(s"[$scope] leaked canary [$canary] in: $text\n") {
+        text should not include canary
+      }
+    }
+
+  /** Substring scan of the whole line plus a structural scan of every leaf. */
+  private def assertJsonHasNoCanary(scope: String, json: String, canaries: Seq[String]): Unit = {
+    assertNoCanary(s"$scope raw", json, canaries)
+    val leaves = leafValues(jsonMapper.readTree(json))
+    canaries.foreach { canary =>
+      withClue(s"[$scope leaf] leaked canary [$canary] in $leaves\n") {
+        leaves.exists(_.contains(canary)) shouldBe false
+      }
+    }
+  }
+
+  // A sanitized Spark-native message must be exactly the bracketed errorClass
+  // token (optionally followed by sqlState) that downstream consumers key on.
+  private val bracketedErrorClass = "^\\[[A-Z0-9_.]+\\]( sqlState=\\[[^\\]]+\\])?$".r
+
+  test("production JSON serializer emits no query content for a real analysis failure") {
+    spark.sql("SELECT 1 AS id, 'x' AS name").createOrReplaceTempView("real_serializer_probe")
+    val column = "nonexistent_col_serializer_9099"
+    val root = failWith(s"SELECT $column FROM real_serializer_probe")
+    val redacted = FlintREPL.redactThrowable(root)
+
+    val logLine = productionLogLine(new OperationMessage(redacted.getMessage, 400), redacted)
+
+    // The emitted line parses as JSON and no leaf value carries query content.
+    assertJsonHasNoCanary(
+      "serializer",
+      logLine,
+      Seq(column, "Project", "SubqueryAlias", "== SQL =="))
+
+    // Positive contract: the OTEL envelope and stable tokens survive.
+    val tree = jsonMapper.readTree(logLine)
+    tree.at("/attributes/exception.type").asText() shouldBe
+      "org.apache.spark.sql.exception.RedactedException"
+    leafValues(tree).exists(_.contains("UNRESOLVED_COLUMN")) shouldBe true
+  }
+
+  private case class CanaryCase(
+      name: String,
+      sql: String,
+      canaries: Seq[String],
+      ansi: Boolean = false,
+      sparkThrowable: Boolean = true,
+      expectCanaryInRaw: Boolean = true,
+      setup: () => Unit = () => ())
+
+  private val longCanary = ("L" * 1500) + "_canary_long_9015"
+
+  // Built from code points so the source stays ASCII (scalastyle forbids
+  // non-ASCII), while the running query still carries real multibyte content.
+  private val unicodeCanary =
+    "canary_" + Seq(0x00fc, 0x00ef, 0x00f6, 0x00e9).map(_.toChar).mkString + "_9014"
+
+  private def matrixCases: Seq[CanaryCase] = Seq(
+    CanaryCase(
+      "unresolved column",
+      "SELECT canary_col_unrsv_9001 FROM real_matrix_vals",
+      Seq("canary_col_unrsv_9001")),
+    CanaryCase(
+      "missing table or view",
+      "SELECT * FROM canary_tbl_missing_9002",
+      Seq("canary_tbl_missing_9002")),
+    CanaryCase(
+      "ambiguous reference",
+      "SELECT canary_ambig_9003 FROM amb_a JOIN amb_b",
+      Seq("canary_ambig_9003"),
+      setup = () => {
+        spark.sql("SELECT 1 AS canary_ambig_9003").createOrReplaceTempView("amb_a")
+        spark.sql("SELECT 2 AS canary_ambig_9003").createOrReplaceTempView("amb_b")
+      }),
+    CanaryCase(
+      "unresolved routine",
+      "SELECT canary_fn_9004(id) FROM real_matrix_vals",
+      Seq("canary_fn_9004")),
+    CanaryCase(
+      "datatype mismatch",
+      "SELECT sum(canary_dtm_9005) FROM (SELECT array(1, 2) AS canary_dtm_9005)",
+      Seq("canary_dtm_9005")),
+    CanaryCase(
+      "parse error",
+      "SELCT canary_parse_9006 FROM real_matrix_vals",
+      Seq("canary_parse_9006")),
+    CanaryCase(
+      "divide by zero (ANSI)",
+      "SELECT canary_div_col_9007 / 0 FROM (SELECT 5 AS canary_div_col_9007)",
+      Seq("canary_div_col_9007"),
+      ansi = true),
+    CanaryCase(
+      "invalid cast (ANSI)",
+      "SELECT CAST('canary_cast_9008' AS INT)",
+      Seq("canary_cast_9008"),
+      ansi = true),
+    CanaryCase(
+      "array index out of bounds (ANSI)",
+      "SELECT array(canary_arr_9009)[10] FROM (SELECT 7 AS canary_arr_9009)",
+      Seq("canary_arr_9009"),
+      ansi = true),
+    CanaryCase(
+      "invalid regex pattern (executor exception, unknown-policy path)",
+      "SELECT canary_rgx_9010col RLIKE '[' FROM (SELECT 'x' AS canary_rgx_9010col)",
+      Seq("canary_rgx_9010col"),
+      sparkThrowable = false,
+      expectCanaryInRaw = false),
+    CanaryCase(
+      "nested CTE + subquery + join plan",
+      "WITH cte AS (SELECT id, name FROM real_matrix_vals) " +
+        "SELECT c.id FROM cte c JOIN real_matrix_vals r ON c.id = r.id " +
+        "WHERE c.canary_nested_9011 > 0",
+      Seq("canary_nested_9011")),
+    CanaryCase(
+      "ARN-shaped backticked identifier",
+      "SELECT `arn:aws:iam::123456789012:role/canary_arn_9012` FROM real_matrix_vals",
+      Seq("arn:aws:iam::123456789012:role/canary_arn_9012", "canary_arn_9012")),
+    CanaryCase(
+      "CRLF literal (ANSI)",
+      "SELECT CAST('canary_crlf_9013\r\nSECOND_LINE_9013' AS INT)",
+      Seq("canary_crlf_9013", "SECOND_LINE_9013"),
+      ansi = true),
+    CanaryCase(
+      "Unicode backticked identifier",
+      s"SELECT `$unicodeCanary` FROM real_matrix_vals",
+      Seq(unicodeCanary)),
+    CanaryCase(
+      "very long backticked identifier",
+      s"SELECT `$longCanary` FROM real_matrix_vals",
+      Seq("_canary_long_9015")))
+
+  matrixCases.foreach { c =>
+    test(s"canary matrix: ${c.name}") {
+      spark.sql("SELECT 1 AS id, 'x' AS name").createOrReplaceTempView("real_matrix_vals")
+      c.setup()
+
+      val root =
+        if (c.ansi) {
+          spark.conf.set("spark.sql.ansi.enabled", "true")
+          try failWith(c.sql)
+          finally spark.conf.unset("spark.sql.ansi.enabled")
+        } else {
+          failWith(c.sql)
+        }
+
+      // Precondition: the raw failure really carries the canary, so redaction is
+      // proven rather than trivially satisfied. The executor-regex case is a
+      // negative control -- its query text never reaches the pattern exception --
+      // so it opts out of this precondition.
+      if (c.expectCanaryInRaw) {
+        val raw = Option(root.getMessage).getOrElse("")
+        withClue(s"raw message did not contain any canary: $raw\n") {
+          c.canaries.exists(raw.contains) shouldBe true
+        }
+      }
+
+      // (1) sanitized message carries no canary ...
+      val sanitized = ErrorSanitizer.sanitizedMessage(root)
+      assertNoCanary("sanitized", sanitized, c.canaries)
+
+      // ... and for a Spark-native failure it is exactly the bracketed errorClass
+      // token (plus optional sqlState) preserved for downstream classification.
+      if (c.sparkThrowable) {
+        withClue(s"sanitized message was not a bare errorClass token: $sanitized\n") {
+          bracketedErrorClass.pattern.matcher(sanitized).matches() shouldBe true
+        }
+      }
+
+      // (2) full persisted error JSON, scanned recursively.
+      assertJsonHasNoCanary("persistedJson", persistedJson(root), c.canaries)
+
+      // (3) exact production log line for the redacted throwable, scanned
+      // recursively across body.message, exception.message/type, and attributes.
+      val redacted = FlintREPL.redactThrowable(root)
+      val logLine = productionLogLine(new OperationMessage(redacted.getMessage, 400), redacted)
+      assertJsonHasNoCanary("productionLogLine", logLine, c.canaries)
+    }
   }
 }
