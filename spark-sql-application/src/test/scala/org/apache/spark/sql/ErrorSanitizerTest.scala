@@ -223,7 +223,7 @@ class ErrorSanitizerTest extends SparkFunSuite with Matchers {
     // rendered by SparkThrowableHelper from error-classes.json with the parameter interpolated --
     // exactly the path that leaks customer identifiers. COLUMN_ALREADY_EXISTS takes a single
     // `columnName` parameter and carries sqlState 42711 in the catalog.
-    val secret = "customer_secret_column_480909524268"
+    val secret = "customer_secret_column_CANARY_ACCOUNT_A"
     val e = new SparkException(
       "COLUMN_ALREADY_EXISTS",
       Map("columnName" -> secret),
@@ -280,7 +280,7 @@ class ErrorSanitizerTest extends SparkFunSuite with Matchers {
   test(
     "sanitizedMessage reduces a hand-built analysis exception to a bare label, recovering no " +
       "token from its free-text message") {
-    val planMarker = "480909524268"
+    val planMarker = "CANARY_ACCOUNT_A"
     val plan = LocalRelation(AttributeReference(s"recipientAccountId_$planMarker", StringType)())
     // A hand-built ExtendedAnalysisException carries no catalog errorClass, so getErrorClass is
     // null. The strict policy must fall back to a bare label rather than parsing tokens (e.g. the

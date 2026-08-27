@@ -785,36 +785,38 @@ class FlintREPLTest
 
     // Column refs whose names embed the (fake) account id and ARN, plus the filter literals that
     // Spark renders into the plan's Filter node.
-    val acctCol = AttributeReference("recipientAccountId_480909524268", StringType)()
+    val acctCol = AttributeReference("recipientAccountId_CANARY_ACCOUNT_A", StringType)()
     val arnCol =
-      AttributeReference("arn_aws_logs_us_east_1_471112993047_aws_controltower", StringType)()
-    val filterValue = "vci-terraform-state-rnd-us-east-1"
+      AttributeReference(
+        "arn_aws_logs_us_east_1_CANARY_ACCOUNT_B_synthetic_log_group",
+        StringType)()
+    val filterValue = "CANARY_FILTER_RESOURCE"
     val plan = Filter(EqualTo(arnCol, Literal(filterValue)), LocalRelation(acctCol, arnCol))
 
     val exception = new ExtendedAnalysisException(
       message = "[UNRESOLVED_COLUMN.WITH_SUGGESTION] A column or function parameter with name " +
-        "`_CWLBasic_Alias_1`.`arn` cannot be resolved. Did you mean one of the following? " +
-        "[`_CWLBasic_Alias_0`.`arn`, `_CWLBasic_Alias_0`.`eventName`].",
+        "`synthetic_source_alias_1`.`arn` cannot be resolved. Did you mean one of the following? " +
+        "[`synthetic_source_alias_0`.`arn`, `synthetic_source_alias_0`.`eventName`].",
       line = Some(1),
       startPosition = Some(295),
       plan = Some(plan))
 
     // Precondition: the raw message really leaks the account id, ARN, and filter value via the plan.
-    exception.getMessage should include("480909524268")
-    exception.getMessage should include("471112993047")
+    exception.getMessage should include("CANARY_ACCOUNT_A")
+    exception.getMessage should include("CANARY_ACCOUNT_B")
     exception.getMessage should include(filterValue)
 
     val result = FlintREPL.processQueryException(exception, mockFlintStatement)
 
     // The plan and every customer value it carried are gone ...
-    result should not include "480909524268"
-    result should not include "471112993047"
+    result should not include "CANARY_ACCOUNT_A"
+    result should not include "CANARY_ACCOUNT_B"
     result should not include filterValue
     result should not include "Filter"
     result should not include "LocalRelation"
     // ... as is the free-text diagnostic, which embedded the customer alias and column names.
     result should not include "UNRESOLVED_COLUMN.WITH_SUGGESTION"
-    result should not include "_CWLBasic_Alias"
+    result should not include "synthetic_source_alias"
     result should not include "cannot be resolved"
     result should not include "Did you mean one of the following?"
     result should not include "line 1 pos 295"
