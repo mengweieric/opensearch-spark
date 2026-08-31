@@ -29,7 +29,7 @@ import org.apache.spark.internal.Logging
 import org.apache.spark.sql.FlintREPL.instantiate
 import org.apache.spark.sql.SparkConfConstants.{DEFAULT_SQL_EXTENSIONS, SQL_EXTENSIONS_KEY}
 import org.apache.spark.sql.catalyst.parser.ParseException
-import org.apache.spark.sql.exception.{RedactedException, UnrecoverableException}
+import org.apache.spark.sql.exception.UnrecoverableException
 import org.apache.spark.sql.flint.config.FlintSparkConf
 import org.apache.spark.sql.flint.config.FlintSparkConf.REFRESH_POLICY
 import org.apache.spark.sql.types._
@@ -478,12 +478,7 @@ trait FlintJobExecutor {
    * log4j stack trace. The persisted/forwarded error string is built separately from
    * [[customerMessage]].
    */
-  private[sql] def redactThrowable(t: Throwable): Throwable = {
-    val redacted =
-      new RedactedException(t.getClass.getName, operatorLogMessage(t))
-    redacted.setStackTrace(t.getStackTrace)
-    redacted
-  }
+  private[sql] def redactThrowable(t: Throwable): Throwable = ErrorSanitizer.redactThrowable(t)
 
   private def handleQueryException(
       t: Throwable,

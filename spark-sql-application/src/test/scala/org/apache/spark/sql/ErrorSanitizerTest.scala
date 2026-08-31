@@ -28,9 +28,10 @@ import org.apache.spark.sql.types.StringType
  * Covers the two halves of the error contract separately: the message (what is read) and the
  * classification (what a consumer branches on). The message itself has two audiences with two
  * policies -- [[ErrorSanitizer.customerMessage]] keeps the actionable diagnostic for the
- * persisted / forwarded record, while [[ErrorSanitizer.operatorLogMessage]] stays strict for the
- * driver logs
- * -- and the classification must not depend on the wording of either.
+ * persisted / forwarded record, while [[ErrorSanitizer.operatorLogMessage]] keeps only
+ * classification-stable, provably non-customer-derived detail for the driver logs (the catalog
+ * errorClass, its static message template with `<param>` placeholders left un-interpolated, and a
+ * safe cause class name) -- and the classification must not depend on the wording of either.
  */
 class ErrorSanitizerTest extends SparkFunSuite with Matchers {
 
@@ -341,10 +342,13 @@ class ErrorSanitizerTest extends SparkFunSuite with Matchers {
 
   // ---- operator log message: strict, classification-only ----
 
-  test("operatorLogMessage emits only the catalog errorClass for a Spark error-class exception") {
+  test(
+    "operatorLogMessage keeps the static catalog template but never the interpolated parameter " +
+      "value for a Spark error-class exception") {
     // A real Spark 3.5.1 SparkThrowable built through the error-class constructor, so getMessage is
     // rendered from the catalog with the parameter interpolated -- the path that would leak the
-    // identifier. The log message must reduce to the stable errorClass alone.
+    // identifier. The log message keeps the static template (which names `<columnName>` as a
+    // placeholder) but never the interpolated value.
     val secret = "customer_secret_column_CANARY_ACCOUNT_A"
     val e = new SparkException(
       "COLUMN_ALREADY_EXISTS",
@@ -356,12 +360,79 @@ class ErrorSanitizerTest extends SparkFunSuite with Matchers {
 
     val logMessage = ErrorSanitizer.operatorLogMessage(e)
 
-    logMessage shouldBe "[COLUMN_ALREADY_EXISTS]"
+    logMessage shouldBe
+      "[COLUMN_ALREADY_EXISTS] The column <columnName> already exists. " +
+      "Consider to choose another name or rename the existing column."
+    // The static placeholder is kept as useful, non-customer diagnostic ...
+    logMessage should include("<columnName>")
+    // ... while the interpolated parameter value never survives.
     logMessage should not include secret
   }
 
   test(
-    "operatorLogMessage drops a SparkThrowable's rendered message and query context entirely") {
+    "operatorLogMessage keeps the unresolved-column template and the static suggestion phrase but " +
+      "never the offending identifier or the suggested value") {
+    // The suggestion phrase ("Did you mean one of the following?") is authored catalog text, so it
+    // is a safe static diagnostic; only the interpolated `<objectName>` and `<proposal>` values are
+    // customer-derived and must not survive.
+    val offending = "customer_col_CANARY_A"
+    val suggestion = "customer_col_CANARY_B"
+    val e = new RuntimeException(
+      s"[UNRESOLVED_COLUMN.WITH_SUGGESTION] A column or function parameter with name `$offending` " +
+        s"cannot be resolved. Did you mean one of the following? [`$suggestion`].")
+      with SparkThrowable {
+      override def getErrorClass: String = "UNRESOLVED_COLUMN.WITH_SUGGESTION"
+    }
+
+    val logMessage = ErrorSanitizer.operatorLogMessage(e)
+
+    logMessage shouldBe
+      "[UNRESOLVED_COLUMN.WITH_SUGGESTION] A column or function parameter with name <objectName> " +
+      "cannot be resolved. Did you mean one of the following? [<proposal>]."
+    logMessage should include("Did you mean one of the following?")
+    logMessage should include("<objectName>")
+    logMessage should include("<proposal>")
+    logMessage should not include offending
+    logMessage should not include suggestion
+  }
+
+  test(
+    "operatorLogMessage keeps the INTERNAL_ERROR template placeholder and a safe cause class but " +
+      "never the wrapped message value") {
+    // INTERNAL_ERROR's template is only the `<message>` placeholder, so the genuinely useful,
+    // provably-safe diagnostic for it is the structured cause class name -- a code identifier, not
+    // a customer value. The interpolated message parameter (which carries the wrapped detail) must
+    // not survive.
+    val secret = "internal_detail_CANARY"
+    val cause = new IllegalStateException("hostile cause detail canary")
+    val e = new SparkException("INTERNAL_ERROR", Map("message" -> secret), cause)
+
+    // Precondition: the rendered message really does interpolate the secret parameter value.
+    e.getMessage should include(secret)
+
+    val logMessage = ErrorSanitizer.operatorLogMessage(e)
+
+    logMessage shouldBe "[INTERNAL_ERROR] <message> cause=[java.lang.IllegalStateException]"
+    logMessage should not include secret
+    logMessage should not include "hostile cause detail"
+  }
+
+  test(
+    "operatorLogMessage emits only the bracketed class for a custom errorClass with no catalog " +
+      "template") {
+    // A custom SparkThrowable can return an arbitrary errorClass that is not in the catalog;
+    // getMessageTemplate throws for it, so the label falls back to the bare bracketed class rather
+    // than emitting anything unvalidated. This matches the previously shipped behavior.
+    val e = new RuntimeException("boom") with SparkThrowable {
+      override def getErrorClass: String = "SOME_CUSTOM_CLASS_NOT_IN_CATALOG"
+    }
+
+    ErrorSanitizer.operatorLogMessage(e) shouldBe "[SOME_CUSTOM_CLASS_NOT_IN_CATALOG]"
+  }
+
+  test(
+    "operatorLogMessage keeps the static template and drops a SparkThrowable's rendered message " +
+      "and query context entirely") {
     val e = new RuntimeException(
       "[DIVIDE_BY_ZERO] Division by zero.\n== SQL ==\nSELECT secret_value / 0 FROM customer_table")
       with SparkThrowable {
@@ -370,10 +441,15 @@ class ErrorSanitizerTest extends SparkFunSuite with Matchers {
 
     val logMessage = ErrorSanitizer.operatorLogMessage(e)
 
-    logMessage shouldBe "[DIVIDE_BY_ZERO]"
+    logMessage shouldBe
+      "[DIVIDE_BY_ZERO] Division by zero. Use `try_divide` to tolerate divisor being 0 and " +
+      "return NULL instead. If necessary set <config> to \"false\" to bypass this error."
+    // The static config placeholder is kept, never an interpolated config value ...
+    logMessage should include("<config>")
+    // ... and none of the throwable's own rendered message or query context leaks.
     logMessage should not include "== SQL =="
     logMessage should not include "secret_value"
-    logMessage should not include "Division by zero"
+    logMessage should not include "customer_table"
   }
 
   test(
@@ -444,17 +520,33 @@ class ErrorSanitizerTest extends SparkFunSuite with Matchers {
     logMessage should not include "myindex"
   }
 
-  test("operatorLogMessage fails closed when policy evaluation itself throws") {
+  test(
+    "operatorLogMessage emits a safe label and class name, never the message, for a chain with " +
+      "no recognized type") {
+    val secret = "customer_literal_CANARY"
+    val e = new IllegalStateException(s"offending value $secret\nplan line")
+
+    val logMessage = ErrorSanitizer.operatorLogMessage(e)
+
+    logMessage shouldBe "[UNKNOWN_ERROR] type=[java.lang.IllegalStateException]"
+    logMessage should not include secret
+    logMessage should not include "plan line"
+  }
+
+  test(
+    "operatorLogMessage does not read getMessage on the unrecognized floor, so a hostile " +
+      "getMessage cannot force a secondary failure") {
     val secret = "customer-secret-literal"
-    // A non-Spark hostile throwable routes to the first-line floor, whose getMessage throws; the
-    // outer guard must fail closed rather than propagate.
+    // A non-Spark hostile throwable whose getMessage throws. The unrecognized floor reads only the
+    // class name, so it returns the safe label rather than invoking getMessage and failing closed.
     val hostile = new RuntimeException(secret) {
       override def getMessage: String = throw new IllegalStateException("cannot render")
     }
 
     val logMessage = ErrorSanitizer.operatorLogMessage(hostile)
 
-    logMessage shouldBe ErrorSanitizer.RedactedFallbackMessage
+    logMessage should startWith("[UNKNOWN_ERROR] type=[")
     logMessage should not include secret
+    logMessage should not include "cannot render"
   }
 }

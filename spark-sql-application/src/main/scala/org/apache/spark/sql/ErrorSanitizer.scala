@@ -13,8 +13,10 @@ import com.amazonaws.services.s3.model.AmazonS3Exception
 import org.opensearch.flint.core.storage.OpenSearchBulkWriteException
 
 import org.apache.spark.SparkThrowable
+import org.apache.spark.SparkThrowableHelper
 import org.apache.spark.internal.Logging
 import org.apache.spark.sql.catalyst.parser.ParseException
+import org.apache.spark.sql.exception.RedactedException
 
 /**
  * Centralized policy for turning a throwable into (a) a message, and (b) a machine-readable
@@ -36,12 +38,16 @@ import org.apache.spark.sql.catalyst.parser.ParseException
  *     appended logical plan tree, the `== SQL ==` block, and any following multi-line query
  *     context. It never appends a SQL state code.
  *   - [[operatorLogMessage]] is what reaches the driver logs. Logs are broadly readable, so this
- *     stays strict: only the stable, catalog-derived `errorClass` plus, for a generic failure
- *     with no `errorClass`, a bounded and safe cause class name. It never surfaces
- *     `getSimpleMessage`, message parameters, query context, or a logical plan. The one bounded
- *     read of `getMessage` is [[platformClassTokenFromMessage]], which extracts only an
- *     allowlisted platform class token (never the surrounding text) as a last-resort cause
- *     handle.
+ *     stays strict: it never surfaces `getSimpleMessage`, an interpolated message, message
+ *     parameter values, query context, or a logical plan. It keeps the maximum diagnostic detail
+ *     that is provably not customer-derived: the stable, catalog-derived `errorClass`; the static
+ *     message *template* for that class, taken from Spark's error-conditions catalog with its
+ *     `<param>` placeholders left un-interpolated so no parameter value is ever substituted in;
+ *     and a bounded, safe cause class name. For a generic failure with no `errorClass` it emits
+ *     the bare `[SPARK_ERROR]` label plus that cause class. It never appends a SQL state code.
+ *     The one bounded read of `getMessage` is [[platformClassTokenFromMessage]], used only when
+ *     no structured cause exists, which extracts only an allowlisted platform class token (never
+ *     the surrounding text) as a last-resort cause handle.
  *
  * Policies are per exception family because there is no single textual rule that is safe for
  * every message. Anything unrecognized falls back to the most conservative option that does not
@@ -60,8 +66,25 @@ object ErrorSanitizer extends Logging {
   /** Label emitted for a Spark-native failure that reports no catalog error class. */
   private[sql] val GenericSparkErrorLabel = "SPARK_ERROR"
 
+  /**
+   * Label emitted for a failure whose cause chain carries no recognized type -- no structured
+   * bulk-write or S3 failure and no [[SparkThrowable]]. The shipped floor logged the deepest
+   * cause's first message line, but for a query failure that line is customer-derived (it can
+   * carry the offending identifier, a literal, or an OpenSearch document value), so it must not
+   * reach the broadly-readable driver log. This label pairs with the deepest cause's bounded,
+   * safe class name instead, giving an operator a type handle with no message text.
+   */
+  private[sql] val UnknownErrorLabel = "UNKNOWN_ERROR"
+
   /** Upper bound on a cause class name emitted into the operator log, as defense in depth. */
   private val MaxCauseClassNameLength = 256
+
+  /**
+   * Upper bound on the static catalog message template emitted into the operator log. The bundled
+   * templates are short, so this is defense in depth against a pathological future catalog entry
+   * rather than an expected truncation.
+   */
+  private val MaxTemplateLength = 1024
 
   /**
    * Fully-qualified class tokens that are safe to surface in the operator log because their
@@ -230,13 +253,16 @@ object ErrorSanitizer extends Logging {
    *     [[AmazonS3Exception]] found, assembled from typed fields and carrying no query content.
    *   - Otherwise, if anything in the chain is a [[SparkThrowable]] (including
    *     [[AnalysisException]], `ExtendedAnalysisException`, and [[ParseException]]): a bracketed
-   *     catalog `errorClass` when present, otherwise the bare `[SPARK_ERROR]` label plus, for a
-   *     generic failure with no `errorClass`, a single bounded and safe cause class name as
-   *     `cause=[...]`. That cause name is taken from the structured immediate cause, or, only
-   *     when none exists, from an allowlisted platform class token in the message text; no other
+   *     catalog `errorClass` when present, followed by that class's static catalog message
+   *     template (placeholders left un-interpolated, carrying no parameter value), otherwise the
+   *     bare `[SPARK_ERROR]` label. In either case a single bounded and safe cause class name is
+   *     appended as `cause=[...]` when one is available. That cause name is taken from the
+   *     structured immediate cause, or, only for a generic failure with no `errorClass` and no
+   *     structured cause, from an allowlisted platform class token in the message text; no other
    *     message content is ever read.
-   *   - Otherwise the first line of the deepest cause, matching the shipped floor for a chain
-   *     with no recognized type.
+   *   - Otherwise, for a chain with no recognized type, a bare [[UnknownErrorLabel]] plus the
+   *     deepest cause's bounded, safe class name ([[unrecognizedThrowableLogLabel]]). No message
+   *     text is read, so the customer-derived first line the shipped floor logged never appears.
    */
   def operatorLogMessage(t: Throwable): String = try {
     operatorPolicyMessage(t)
@@ -246,6 +272,21 @@ object ErrorSanitizer extends Logging {
         s"Failed to build operator log message for throwable of type [${t.getClass.getName}] " +
           s"(sanitizer error type [${e.getClass.getName}]); returning redacted message")
       RedactedFallbackMessage
+  }
+
+  /**
+   * Wraps a throwable so that only its [[operatorLogMessage]] is ever exposed via `getMessage`,
+   * `getLocalizedMessage`, `toString`, and the rendered stack-trace header, while preserving the
+   * original exception type name and frames for debugging. This is the single redaction point for
+   * the driver logs: a redacted throwable can be handed to any logger (directly, or via
+   * [[org.apache.spark.sql.util.ThrowableHandler]]) without the original message text, query
+   * context, or logical plan leaking through the logged exception. The persisted / forwarded
+   * error string is built separately from [[customerMessage]].
+   */
+  def redactThrowable(t: Throwable): Throwable = {
+    val redacted = new RedactedException(t.getClass.getName, operatorLogMessage(t))
+    redacted.setStackTrace(t.getStackTrace)
+    redacted
   }
 
   private def customerPolicyMessage(t: Throwable): String = t match {
@@ -261,9 +302,9 @@ object ErrorSanitizer extends Logging {
   /**
    * Walks the cause chain so a wrapper cannot hide the failure it carries or downgrade it to the
    * raw first-line floor, mirroring [[classify]]. See [[operatorLogMessage]] for the resolution
-   * order. The floor reads the deepest cause's message, which is the throwable the customer
-   * message and classification are built from, so a chain with no recognized type logs the same
-   * first line it did before wrappers were preserved for this channel.
+   * order. When no recognized type is found, the floor emits a bare label plus the deepest
+   * cause's safe class name via [[unrecognizedThrowableLogLabel]] rather than reading any message
+   * text, so a customer-derived first line can never reach the driver log.
    */
   private def operatorPolicyMessage(t: Throwable): String = {
     val chain = causeChain(t)
@@ -276,7 +317,27 @@ object ErrorSanitizer extends Logging {
         if (chain.exists(_.isInstanceOf[SparkThrowable])) Some(sparkThrowableLogLabel(t))
         else None
       }
-      .getOrElse(firstLine(chain.last.getMessage))
+      .getOrElse(unrecognizedThrowableLogLabel(chain))
+  }
+
+  /**
+   * The operator-log label for a cause chain that carries no recognized type. Emits only the bare
+   * [[UnknownErrorLabel]] plus a bounded, safe class name for the deepest cause -- a code
+   * identifier, never a customer value, consistent with [[safeCauseClassName]]. Unlike the
+   * shipped floor it reads no message text, so an offending identifier, a literal, or an
+   * OpenSearch document value that a query failure's message can carry never reaches the log.
+   * `getClass` is read under a guard so even a pathological throwable yields the bare label
+   * rather than a secondary failure.
+   */
+  private def unrecognizedThrowableLogLabel(chain: Stream[Throwable]): String = {
+    val deepest = chain.last
+    val className =
+      try Some(boundName(deepest.getClass.getName))
+      catch { case NonFatal(_) => None }
+    className match {
+      case Some(name) => s"[$UnknownErrorLabel] type=[$name]"
+      case None => s"[$UnknownErrorLabel]"
+    }
   }
 
   private def s3StructuredMessage(s3: AmazonS3Exception): String =
@@ -306,26 +367,66 @@ object ErrorSanitizer extends Logging {
   /**
    * The strict operator-log label for a Spark-native failure.
    *
-   *   - When the chain carries a catalog `errorClass`, that class alone is the label. It is drawn
-   *     from Spark's error-conditions catalog, carries no query content, and is itself the stable
-   *     identifier, so nothing further is appended.
+   *   - When the chain carries a catalog `errorClass`, that class is the leading token, followed
+   *     by the static message *template* for the class when one resolves. The template is read
+   *     from Spark's error-conditions catalog via [[catalogMessageTemplate]] with its `<param>`
+   *     placeholders left un-interpolated, so it is provably free of parameter values, the
+   *     offending identifier, the suggestion, any literal, and the query. It is the maximum
+   *     diagnostic detail that is not customer-derived. When the class has no resolvable template
+   *     (an unknown or malformed class) only the bracketed class is emitted, matching the
+   *     previously shipped behavior.
    *   - For a generic Spark failure that reports no `errorClass`, the bare
-   *     [[GenericSparkErrorLabel]] is emitted plus, when one can be obtained safely, a single
-   *     bounded cause class name so an operator keeps a debugging handle. The cause class comes
-   *     first from the structured immediate cause ([[safeCauseClassName]]); only when there is
-   *     none is a strictly-allowlisted platform class token recovered from the message text
-   *     ([[platformClassTokenFromMessage]]). No other message text is read.
+   *     [[GenericSparkErrorLabel]] is emitted.
+   *
+   * In both cases a single bounded, safe cause class name is appended as `cause=[...]` when one
+   * is available. It comes first from the structured immediate cause ([[safeCauseClassName]]);
+   * only for the generic no-`errorClass` path, and only when there is no structured cause, is a
+   * strictly-allowlisted platform class token recovered from the message text
+   * ([[platformClassTokenFromMessage]]). No other message text is read. A cause class name is a
+   * code identifier, never a customer value, so it is safe to log; for an opaque `INTERNAL_ERROR`
+   * (whose template is only the `<message>` placeholder) it is often the one useful handle.
    */
   private def sparkThrowableLogLabel(t: Throwable): String =
     firstErrorClass(t) match {
       case Some(errorClass) =>
-        s"[$errorClass]"
+        val label = new StringBuilder("[").append(errorClass).append("]")
+        catalogMessageTemplate(errorClass).foreach(template => label.append(" ").append(template))
+        safeCauseClassName(t).foreach(cause => label.append(" cause=[").append(cause).append("]"))
+        label.toString
       case None =>
         safeCauseClassName(t).orElse(platformClassTokenFromMessage(t)) match {
           case Some(causeName) => s"[$GenericSparkErrorLabel] cause=[$causeName]"
           case None => s"[$GenericSparkErrorLabel]"
         }
     }
+
+  /**
+   * The static catalog message template for an error class, normalized for a single log line, or
+   * None when no safe template can be produced.
+   *
+   * The template is read from Spark's bundled error-conditions catalog
+   * ([[org.apache.spark.SparkThrowableHelper.errorReader]]), which keeps the authored `<param>`
+   * placeholders literal and does not substitute the throwable's parameter values. It is
+   * therefore derived entirely from the platform's static resources and is independent of the
+   * specific failure: no customer identifier, suggestion, literal, operand, or query text can
+   * appear in it. `getMessageTemplate` throws for an unknown or malformed class name (a custom
+   * throwable can return an arbitrary `errorClass`), so the lookup is guarded and yields None in
+   * that case rather than emitting anything unvalidated. Newlines and repeated whitespace are
+   * collapsed to single spaces so the template cannot introduce extra log lines, and the result
+   * is length-bounded as defense in depth.
+   */
+  private def catalogMessageTemplate(errorClass: String): Option[String] =
+    try {
+      Option(SparkThrowableHelper.errorReader.getMessageTemplate(errorClass))
+        .map(template => boundTemplate(template.replaceAll("\\s+", " ").trim))
+        .filter(_.nonEmpty)
+    } catch {
+      case NonFatal(_) => None
+    }
+
+  private def boundTemplate(template: String): String =
+    if (template.length <= MaxTemplateLength) template
+    else template.substring(0, MaxTemplateLength)
 
   /**
    * First non-empty catalog error class in the cause chain, reading the typed field defensively.

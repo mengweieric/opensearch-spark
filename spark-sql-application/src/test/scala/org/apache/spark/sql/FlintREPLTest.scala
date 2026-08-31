@@ -1095,9 +1095,15 @@ class FlintREPLTest
   }
 
   test(
-    "operatorLogMessage keeps only the first line for non-analysis throwables (defense-in-depth)") {
+    "operatorLogMessage emits a safe label and class name, never the message, for a non-analysis " +
+      "throwable with no recognized type") {
     val exception = new RuntimeException("summary line\nsecret-detail-line\nmore-secret")
-    FlintREPL.operatorLogMessage(exception) shouldBe "summary line"
+    // The shipped floor logged the raw first line; that line is customer-derived for a query
+    // failure, so it is now replaced by a bare label plus the deepest cause's safe class name.
+    FlintREPL.operatorLogMessage(exception) shouldBe
+      "[UNKNOWN_ERROR] type=[java.lang.RuntimeException]"
+    FlintREPL.operatorLogMessage(exception) should not include "summary line"
+    FlintREPL.operatorLogMessage(exception) should not include "secret-detail-line"
   }
 
   test("customerMessage returns empty string for a null message without throwing") {

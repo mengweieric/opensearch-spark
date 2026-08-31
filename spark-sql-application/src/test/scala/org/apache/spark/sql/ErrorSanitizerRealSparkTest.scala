@@ -28,8 +28,10 @@ import org.apache.spark.sql.test.SharedSparkSessionBase
  * ([[ErrorSanitizer.customerMessage]], which backs the persisted error JSON) keeps the actionable
  * diagnostic but drops the query itself (the logical plan and the {@code == SQL ==} block) and
  * never appends a SQL state. The operator log message ([[ErrorSanitizer.operatorLogMessage]], the
- * one [[FlintREPL.redactThrowable]] wraps for the driver logs) stays strict: only the catalog
- * errorClass.
+ * one [[FlintREPL.redactThrowable]] wraps for the driver logs) keeps only provably
+ * non-customer-derived detail: the catalog errorClass and its static message template, whose
+ * `<param>` placeholders are left un-interpolated so no offending identifier, suggestion value,
+ * literal, or query text can appear.
  */
 class ErrorSanitizerRealSparkTest
     extends QueryTest
@@ -90,11 +92,14 @@ class ErrorSanitizerRealSparkTest
     customer should not include "LocalRelation"
     customer should not include "sqlState=["
 
-    // Operator log message: strict, the catalog errorClass only -- no column, no suggestion, no plan.
+    // Operator log message: the catalog errorClass plus its static template. The static suggestion
+    // phrase is authored catalog text and is kept, but the offending column, the interpolated
+    // `<objectName>`/`<proposal>` values, and the plan are gone.
     val log = ErrorSanitizer.operatorLogMessage(analysis)
     log should include("UNRESOLVED_COLUMN")
+    log should include("Did you mean one of the following?")
+    log should include("<objectName>")
     log should not include column
-    log should not include "Did you mean"
     log should not include "Project"
 
     ErrorSanitizer.classify(analysis).errorCode shouldBe ErrorCode.QueryAnalysisError
@@ -129,10 +134,14 @@ class ErrorSanitizerRealSparkTest
     customer should not include rawSqlCanary
     customer should not include "sqlState=["
 
-    // Operator log message: the catalog errorClass only.
+    // Operator log message: the catalog errorClass plus its static template ("Syntax error at or
+    // near <error><hint>."). The verbatim query and offending token value never appear.
     val log = ErrorSanitizer.operatorLogMessage(parse)
     log should include("PARSE_SYNTAX_ERROR")
+    log should include("Syntax error at or near")
+    log should include("<error>")
     log should not include rawSqlCanary
+    log should not include offendingToken
 
     ErrorSanitizer.classify(parse).errorCode shouldBe ErrorCode.QuerySyntaxError
 
@@ -162,8 +171,13 @@ class ErrorSanitizerRealSparkTest
     customer should not include "SELECT"
     customer should not include "sqlState=["
 
-    // Operator log message: the errorClass only.
-    ErrorSanitizer.operatorLogMessage(runtime) shouldBe "[DIVIDE_BY_ZERO]"
+    // Operator log message: the errorClass plus its static template, keeping the `<config>`
+    // placeholder but no interpolated value and none of the appended query fragment.
+    val log = ErrorSanitizer.operatorLogMessage(runtime)
+    log should startWith("[DIVIDE_BY_ZERO] Division by zero.")
+    log should include("<config>")
+    log should not include "== SQL"
+    log should not include "SELECT"
 
     ErrorSanitizer.classify(runtime).errorCode shouldBe ErrorCode.SparkQueryError
 
@@ -190,8 +204,12 @@ class ErrorSanitizerRealSparkTest
     customer should include("Cannot resolve the runtime replaceable expression")
     customer should not include "sqlState=["
 
-    // Operator log stays strict: the INTERNAL_ERROR class only, no message text.
-    ErrorSanitizer.operatorLogMessage(replaceable) shouldBe "[INTERNAL_ERROR]"
+    // Operator log keeps the INTERNAL_ERROR class and its template, which is only the `<message>`
+    // placeholder -- so the operand canary and the interpolated message text never appear.
+    val log = ErrorSanitizer.operatorLogMessage(replaceable)
+    log shouldBe "[INTERNAL_ERROR] <message>"
+    log should not include "canary_operand_replaceable"
+    log should not include "Cannot resolve the runtime replaceable expression"
 
     val json = persistedJson(replaceable)
     // The persisted record carries the phrase under the real SparkException type, so the supplied
@@ -246,19 +264,23 @@ class ErrorSanitizerRealSparkTest
     redacted.printStackTrace(new java.io.PrintWriter(sw))
     val rendered = sw.toString
 
-    // No query-derived content in any field the log event exposes.
+    // No query-derived content in any field the log event exposes. ("Did you mean one of the
+    // following?" is authored catalog template text, not query content, so it may appear; the
+    // offending column and the interpolated suggestion value must not.)
     Seq(bodyMessage, exceptionMessage, exceptionType, redacted.toString, rendered).foreach {
       field =>
         field should not include column
         field should not include "Project"
         field should not include "SubqueryAlias"
         field should not include "== SQL =="
-        field should not include "Did you mean"
     }
 
     // Positive contract: the surviving content is stable and non-customer.
     bodyMessage should include(ExceptionMessages.QueryAnalysisErrorPrefix)
-    exceptionMessage should include("UNRESOLVED_COLUMN") // errorClass-only log message
+    exceptionMessage should include(
+      "UNRESOLVED_COLUMN"
+    ) // errorClass + static template log message
+    exceptionMessage should include("<objectName>") // static placeholder retained, no value
     exceptionType shouldBe "org.apache.spark.sql.exception.RedactedException"
     // The original exception type is still recoverable from the rendered header for debugging.
     redacted.toString should include("ExtendedAnalysisException")
@@ -323,10 +345,14 @@ class ErrorSanitizerRealSparkTest
     }
   }
 
-  // A strict operator-log message for a Spark-native failure is exactly the
-  // bracketed errorClass token, optionally followed by a safe cause class name.
-  private val bracketedErrorClass =
-    "^\\[[A-Z0-9_.]+\\]( cause=\\[[^\\]]+\\])?$".r
+  // The operator-log message for a Spark-native failure leads with the bracketed catalog
+  // errorClass token and is a single line. What follows the token is the static catalog message
+  // template (placeholders left un-interpolated) and, optionally, a safe cause class name. The
+  // template is authored, non-customer text, so its exact content is not constrained here; the
+  // no-canary guarantee is asserted separately by assertNoCanary. Matching `.*` (which excludes
+  // newlines by default) also proves the message never spans multiple log lines.
+  private val operatorLogShape =
+    "^\\[[A-Z0-9_.]+\\]( .*)?$".r
 
   test(
     "production JSON serializer emits no query content in the operator log for an analysis failure") {
@@ -468,11 +494,11 @@ class ErrorSanitizerRealSparkTest
       val log = ErrorSanitizer.operatorLogMessage(root)
       assertNoCanary("operatorLogMessage", log, c.canaries)
 
-      // ... and for a Spark-native failure it is exactly the bracketed errorClass token (plus an
-      // optional safe cause class name).
+      // ... and for a Spark-native failure it leads with the bracketed errorClass token, followed
+      // by the static catalog template (and an optional safe cause class name), on a single line.
       if (c.sparkThrowable) {
-        withClue(s"operator log message was not a bare errorClass token: $log\n") {
-          bracketedErrorClass.pattern.matcher(log).matches() shouldBe true
+        withClue(s"operator log message was not a well-formed errorClass log line: $log\n") {
+          operatorLogShape.pattern.matcher(log).matches() shouldBe true
         }
       }
 

@@ -13,11 +13,13 @@ package org.apache.spark.sql.exception
  * query content in their `getMessage` and `getSimpleMessage` (the offending column/table/view and
  * alias names, "Did you mean" suggestions, line and position text, the appended logical plan
  * tree, and the raw SQL text in a `== SQL ==` block). The caller computes a sanitized message
- * that is derived only from the stable `errorClass` and, when present, `sqlState` from Spark's
- * error-conditions catalog, and wraps the original throwable in this class before it reaches any
- * logger or is forwarded downstream. That ensures the query content cannot leak through
- * `getMessage`, `getLocalizedMessage`, `toString`, or the rendered stack trace, while still
- * keeping the exception type name and frames needed to debug where the error arose.
+ * that is derived only from Spark's error-conditions catalog -- the stable `errorClass`, the
+ * static message template for that class with its `<param>` placeholders left un-interpolated,
+ * and, for a generic failure, a safe cause class name -- and wraps the original throwable in this
+ * class before it reaches any logger or is forwarded downstream. That ensures the query content
+ * cannot leak through `getMessage`, `getLocalizedMessage`, `toString`, or the rendered stack
+ * trace, while still keeping the exception type name and frames needed to debug where the error
+ * arose.
  *
  * @param originalClassName
  *   fully qualified name of the original exception type, surfaced in the rendered stack trace
