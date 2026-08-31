@@ -40,7 +40,8 @@ import org.apache.spark.sql.catalyst.parser.ParseException
  *     with no `errorClass`, a bounded and safe cause class name. It never surfaces
  *     `getSimpleMessage`, message parameters, query context, or a logical plan. The one bounded
  *     read of `getMessage` is [[platformClassTokenFromMessage]], which extracts only an
- *     allowlisted platform class token (never the surrounding text) as a last-resort cause handle.
+ *     allowlisted platform class token (never the surrounding text) as a last-resort cause
+ *     handle.
  *
  * Policies are per exception family because there is no single textual rule that is safe for
  * every message. Anything unrecognized falls back to the most conservative option that does not
@@ -63,13 +64,13 @@ object ErrorSanitizer extends Logging {
   private val MaxCauseClassNameLength = 256
 
   /**
-   * Fully-qualified class tokens that are safe to surface in the operator log because their package
-   * belongs to the platform, not to customer or application code. Used only to recover a cause
-   * class name from message text when no structured cause is available. Each alternative is matched
-   * as a package prefix (it must be followed by a `.` and cannot be embedded inside another
-   * qualified identifier), the token must end in a segment terminating in `Exception` or `Error`,
-   * and only the token itself is ever emitted -- never the surrounding text. An arbitrary customer
-   * or application package token does not match and is therefore rejected.
+   * Fully-qualified class tokens that are safe to surface in the operator log because their
+   * package belongs to the platform, not to customer or application code. Used only to recover a
+   * cause class name from message text when no structured cause is available. Each alternative is
+   * matched as a package prefix (it must be followed by a `.` and cannot be embedded inside
+   * another qualified identifier), the token must end in a segment terminating in `Exception` or
+   * `Error`, and only the token itself is ever emitted -- never the surrounding text. An
+   * arbitrary customer or application package token does not match and is therefore rejected.
    */
   private val PlatformExceptionClassPattern =
     ("(?<![A-Za-z0-9_$.])(?:javax|java|scala|org\\.apache\\.spark|org\\.opensearch)" +
@@ -218,22 +219,24 @@ object ErrorSanitizer extends Logging {
 
   /**
    * Returns the message written to the driver logs, redacted to the stable classification only.
-   * The whole cause chain is inspected so an enclosing wrapper cannot hide the failure it carries:
-   * `processQueryException` unwraps to the root cause for the customer message and classification,
-   * but hands the original throwable here so a wrapper (for example a task-failure `SparkException`
-   * around a non-Spark cause) still routes to the strict label instead of the raw first-line floor.
+   * The whole cause chain is inspected so an enclosing wrapper cannot hide the failure it
+   * carries: `processQueryException` unwraps to the root cause for the customer message and
+   * classification, but hands the original throwable here so a wrapper (for example a
+   * task-failure `SparkException` around a non-Spark cause) still routes to the strict label
+   * instead of the raw first-line floor.
    *
    * Resolution order over the chain:
-   *   - The structured fields of the first [[OpenSearchBulkWriteException]] or [[AmazonS3Exception]]
-   *     found, assembled from typed fields and carrying no query content.
-   *   - Otherwise, if anything in the chain is a [[SparkThrowable]] (including [[AnalysisException]],
-   *     `ExtendedAnalysisException`, and [[ParseException]]): a bracketed catalog `errorClass` when
-   *     present, otherwise the bare `[SPARK_ERROR]` label plus, for a generic failure with no
-   *     `errorClass`, a single bounded and safe cause class name as `cause=[...]`. That cause name
-   *     is taken from the structured immediate cause, or, only when none exists, from an allowlisted
-   *     platform class token in the message text; no other message content is ever read.
-   *   - Otherwise the first line of the deepest cause, matching the shipped floor for a chain with
-   *     no recognized type.
+   *   - The structured fields of the first [[OpenSearchBulkWriteException]] or
+   *     [[AmazonS3Exception]] found, assembled from typed fields and carrying no query content.
+   *   - Otherwise, if anything in the chain is a [[SparkThrowable]] (including
+   *     [[AnalysisException]], `ExtendedAnalysisException`, and [[ParseException]]): a bracketed
+   *     catalog `errorClass` when present, otherwise the bare `[SPARK_ERROR]` label plus, for a
+   *     generic failure with no `errorClass`, a single bounded and safe cause class name as
+   *     `cause=[...]`. That cause name is taken from the structured immediate cause, or, only
+   *     when none exists, from an allowlisted platform class token in the message text; no other
+   *     message content is ever read.
+   *   - Otherwise the first line of the deepest cause, matching the shipped floor for a chain
+   *     with no recognized type.
    */
   def operatorLogMessage(t: Throwable): String = try {
     operatorPolicyMessage(t)
@@ -258,9 +261,9 @@ object ErrorSanitizer extends Logging {
   /**
    * Walks the cause chain so a wrapper cannot hide the failure it carries or downgrade it to the
    * raw first-line floor, mirroring [[classify]]. See [[operatorLogMessage]] for the resolution
-   * order. The floor reads the deepest cause's message, which is the throwable the customer message
-   * and classification are built from, so a chain with no recognized type logs the same first line
-   * it did before wrappers were preserved for this channel.
+   * order. The floor reads the deepest cause's message, which is the throwable the customer
+   * message and classification are built from, so a chain with no recognized type logs the same
+   * first line it did before wrappers were preserved for this channel.
    */
   private def operatorPolicyMessage(t: Throwable): String = {
     val chain = causeChain(t)
@@ -306,12 +309,12 @@ object ErrorSanitizer extends Logging {
    *   - When the chain carries a catalog `errorClass`, that class alone is the label. It is drawn
    *     from Spark's error-conditions catalog, carries no query content, and is itself the stable
    *     identifier, so nothing further is appended.
-   *   - For a generic Spark failure that reports no `errorClass`, the bare [[GenericSparkErrorLabel]]
-   *     is emitted plus, when one can be obtained safely, a single bounded cause class name so an
-   *     operator keeps a debugging handle. The cause class comes first from the structured immediate
-   *     cause ([[safeCauseClassName]]); only when there is none is a strictly-allowlisted platform
-   *     class token recovered from the message text ([[platformClassTokenFromMessage]]). No other
-   *     message text is read.
+   *   - For a generic Spark failure that reports no `errorClass`, the bare
+   *     [[GenericSparkErrorLabel]] is emitted plus, when one can be obtained safely, a single
+   *     bounded cause class name so an operator keeps a debugging handle. The cause class comes
+   *     first from the structured immediate cause ([[safeCauseClassName]]); only when there is
+   *     none is a strictly-allowlisted platform class token recovered from the message text
+   *     ([[platformClassTokenFromMessage]]). No other message text is read.
    */
   private def sparkThrowableLogLabel(t: Throwable): String =
     firstErrorClass(t) match {
@@ -359,15 +362,15 @@ object ErrorSanitizer extends Logging {
 
   /**
    * A best-effort, strictly-bounded platform exception class token recovered from a throwable's
-   * message text, used only as a fallback when no structured cause class is available -- the review
-   * case where a generic `SparkException` names the underlying platform exception only in its
-   * message. This is the single place the operator-log channel reads `getMessage`, and it never
-   * emits surrounding text: it returns only a fully-qualified class token that begins with an
-   * allowlisted platform package prefix, ends in `Exception`/`Error`, and is bounded to
-   * [[MaxCauseClassNameLength]] characters (see [[PlatformExceptionClassPattern]]). `getMessage` is
-   * read under a guard so a hostile override cannot propagate a secondary failure, and an arbitrary
-   * customer or application package token is rejected because it does not match the allowlist.
-   * Returns None when nothing matches, which is the common case.
+   * message text, used only as a fallback when no structured cause class is available -- the
+   * review case where a generic `SparkException` names the underlying platform exception only in
+   * its message. This is the single place the operator-log channel reads `getMessage`, and it
+   * never emits surrounding text: it returns only a fully-qualified class token that begins with
+   * an allowlisted platform package prefix, ends in `Exception`/`Error`, and is bounded to
+   * [[MaxCauseClassNameLength]] characters (see [[PlatformExceptionClassPattern]]). `getMessage`
+   * is read under a guard so a hostile override cannot propagate a secondary failure, and an
+   * arbitrary customer or application package token is rejected because it does not match the
+   * allowlist. Returns None when nothing matches, which is the common case.
    */
   private def platformClassTokenFromMessage(t: Throwable): Option[String] = {
     val message =

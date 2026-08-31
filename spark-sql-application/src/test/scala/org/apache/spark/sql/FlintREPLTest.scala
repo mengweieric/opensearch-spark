@@ -1187,8 +1187,7 @@ class FlintREPLTest
     redacted.toString should include("SparkException")
   }
 
-  test(
-    "a SparkException whose getCause throws stays bounded and strict on the production path") {
+  test("a SparkException whose getCause throws stays bounded and strict on the production path") {
     val mockFlintStatement = mock[FlintStatement]
     val wrapper = new SparkException("boom_first_line_CANARY") {
       override def getCause: Throwable = throw new RuntimeException("secondary_failure_CANARY")
@@ -1207,7 +1206,8 @@ class FlintREPLTest
     redacted.getMessage should not include "boom_first_line_CANARY"
   }
 
-  test("a self-referencing SparkException cause is cycle-safe and strict on the production path") {
+  test(
+    "a self-referencing SparkException cause is cycle-safe and strict on the production path") {
     val mockFlintStatement = mock[FlintStatement]
     val selfReferencing = new SparkException("cycle_first_line_CANARY") {
       override def getCause: Throwable = this
