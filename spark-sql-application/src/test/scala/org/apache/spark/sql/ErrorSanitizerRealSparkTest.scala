@@ -13,6 +13,7 @@ import org.opensearch.flint.core.logging.{CustomLogging, ExceptionMessages, Oper
 import org.scalatest.matchers.should.Matchers
 import org.scalatestplus.mockito.MockitoSugar
 
+import org.apache.spark.SparkException
 import org.apache.spark.sql.ErrorSanitizer.ErrorCode
 import org.apache.spark.sql.test.SharedSparkSessionBase
 
@@ -21,9 +22,14 @@ import org.apache.spark.sql.test.SharedSparkSessionBase
  * the analysis/parse/runtime exceptions by hand. This suite instead provokes the real Spark 3.5.1
  * exceptions from a live [[SparkSession]] so the sanitizer is exercised against the exact message
  * shapes Spark actually emits (including the appended logical plan and the {@code == SQL ==}
- * fragment) rather than a reconstruction of them. It routes each through both the sanitizer
- * directly and the full [[FlintREPL.processQueryException]] sink so the persisted error JSON is
- * asserted end to end.
+ * fragment) rather than a reconstruction of them.
+ *
+ * The two message audiences are asserted separately. The customer / persisted message
+ * ([[ErrorSanitizer.customerMessage]], which backs the persisted error JSON) keeps the actionable
+ * diagnostic but drops the query itself (the logical plan and the {@code == SQL ==} block) and
+ * never appends a SQL state. The operator log message ([[ErrorSanitizer.operatorLogMessage]], the
+ * one [[FlintREPL.redactThrowable]] wraps for the driver logs) stays strict: only the catalog
+ * errorClass.
  */
 class ErrorSanitizerRealSparkTest
     extends QueryTest
@@ -61,7 +67,8 @@ class ErrorSanitizerRealSparkTest
       .asInstanceOf[java.util.Map[String, Object]]
   }
 
-  test("real unresolved-column AnalysisException: only the catalog errorClass survives") {
+  test(
+    "real unresolved-column AnalysisException: customer keeps the diagnostic, drops the plan") {
     spark.sql("SELECT 1 AS id, 'x' AS name").createOrReplaceTempView("real_probe_vals")
     val column = "nonexistent_col_realspark_5551"
     val analysis = failWith(s"SELECT $column FROM real_probe_vals")
@@ -71,54 +78,72 @@ class ErrorSanitizerRealSparkTest
     analysis.getMessage should include(column)
     analysis.isInstanceOf[AnalysisException] shouldBe true
 
-    val sanitized = ErrorSanitizer.sanitizedMessage(analysis)
-    // The plan tree and its node names are gone ...
-    sanitized should not include "Project"
-    sanitized should not include "SubqueryAlias"
-    sanitized should not include "LocalRelation"
-    sanitized should not include "View"
-    // ... and so is every query-derived value: the offending column name, the "Did you mean"
-    // suggestion list, and the line/position text. The strict policy emits only the stable,
-    // catalog-derived errorClass (an UNRESOLVED_COLUMN family constant), never getSimpleMessage.
-    sanitized should not include column
-    sanitized should not include "Did you mean"
-    sanitized should not include "pos "
-    sanitized should include("UNRESOLVED_COLUMN")
+    // Customer / persisted message: keeps the actionable diagnostic (errorClass, the offending
+    // column, and the "Did you mean" suggestion) ...
+    val customer = ErrorSanitizer.customerMessage(analysis)
+    customer should include("UNRESOLVED_COLUMN")
+    customer should include(column)
+    customer should include("Did you mean")
+    // ... but the appended logical plan tree and its node names are gone, and no sqlState is added.
+    customer should not include "Project"
+    customer should not include "SubqueryAlias"
+    customer should not include "LocalRelation"
+    customer should not include "sqlState=["
+
+    // Operator log message: strict, the catalog errorClass only -- no column, no suggestion, no plan.
+    val log = ErrorSanitizer.operatorLogMessage(analysis)
+    log should include("UNRESOLVED_COLUMN")
+    log should not include column
+    log should not include "Did you mean"
+    log should not include "Project"
 
     ErrorSanitizer.classify(analysis).errorCode shouldBe ErrorCode.QueryAnalysisError
 
+    // The persisted JSON carries the customer diagnostic (column + suggestion) but never the plan.
     val json = persistedJson(analysis)
     json should not include "Project"
-    json should not include column
+    json should not include "LocalRelation"
+    json should include(column)
     json should include(""""errorCode":"QUERY_ANALYSIS_ERROR"""")
     json should include(
       """"exception.type":"org.apache.spark.sql.catalyst.ExtendedAnalysisException"""")
   }
 
-  test("real ParseException: only the catalog errorClass survives, no query text or position") {
-    val queryCanary = "bogus_realspark_6662"
-    val parse = failWith(s"SELCT $queryCanary FROM real_probe_vals")
+  test(
+    "real ParseException: customer keeps the parser detail but drops the == SQL == query block") {
+    spark.sql("SELECT 1 AS id, 'x' AS name").createOrReplaceTempView("real_probe_vals")
+    // The canary lives in a string literal, so it appears only in the verbatim == SQL == echo, not
+    // in the syntax diagnostic. The trailing token is what the parser actually reports as offending.
+    val rawSqlCanary = "raw_sql_canary_6662"
+    val offendingToken = "BOGUSTOKEN_6662"
+    val parse =
+      failWith(s"SELECT id FROM real_probe_vals WHERE name = '$rawSqlCanary' $offendingToken")
 
     parse.getMessage should include("== SQL ==")
-    parse.getMessage should include(queryCanary)
+    parse.getMessage should include(rawSqlCanary)
 
-    val sanitized = ErrorSanitizer.sanitizedMessage(parse)
-    sanitized should not include "== SQL =="
-    sanitized should not include queryCanary
-    // The free-text syntax diagnostic and the line/position text are query-derived and gone; only
-    // the stable catalog errorClass (and its sqlState) remain.
-    sanitized should not include "Syntax error"
-    sanitized should not include "pos "
-    sanitized should include("PARSE_SYNTAX_ERROR")
+    // Customer message: the parser diagnostic survives; the verbatim query does not, and no sqlState.
+    val customer = ErrorSanitizer.customerMessage(parse)
+    customer should include("PARSE_SYNTAX_ERROR")
+    customer should not include "== SQL =="
+    customer should not include rawSqlCanary
+    customer should not include "sqlState=["
+
+    // Operator log message: the catalog errorClass only.
+    val log = ErrorSanitizer.operatorLogMessage(parse)
+    log should include("PARSE_SYNTAX_ERROR")
+    log should not include rawSqlCanary
 
     ErrorSanitizer.classify(parse).errorCode shouldBe ErrorCode.QuerySyntaxError
 
     val json = persistedJson(parse)
-    json should not include queryCanary
+    json should not include rawSqlCanary
+    json should not include "== SQL =="
     json should include(""""errorCode":"QUERY_SYNTAX_ERROR"""")
   }
 
-  test("real runtime SparkThrowable: only errorClass and sqlState survive, no query fragment") {
+  test(
+    "real runtime SparkThrowable: customer keeps the first-line diagnostic, drops the SQL frag") {
     spark.conf.set("spark.sql.ansi.enabled", "true")
     val runtime =
       try failWith("SELECT 1 / 0 AS x")
@@ -128,15 +153,53 @@ class ErrorSanitizerRealSparkTest
     runtime.getMessage should include("== SQL")
     runtime.isInstanceOf[org.apache.spark.SparkThrowable] shouldBe true
 
-    val sanitized = ErrorSanitizer.sanitizedMessage(runtime)
-    sanitized shouldBe "[DIVIDE_BY_ZERO] sqlState=[22012]"
-    sanitized should not include "== SQL"
-    sanitized should not include "SELECT"
+    // Customer message: the first-line diagnostic survives; the appended query fragment does not,
+    // and no sqlState token is added.
+    val customer = ErrorSanitizer.customerMessage(runtime)
+    customer should include("[DIVIDE_BY_ZERO]")
+    customer should include("Division by zero")
+    customer should not include "== SQL"
+    customer should not include "SELECT"
+    customer should not include "sqlState=["
+
+    // Operator log message: the errorClass only.
+    ErrorSanitizer.operatorLogMessage(runtime) shouldBe "[DIVIDE_BY_ZERO]"
 
     ErrorSanitizer.classify(runtime).errorCode shouldBe ErrorCode.SparkQueryError
 
     val json = persistedJson(runtime)
     json should not include "SELECT 1 / 0"
+    json should include(""""errorCode":"SPARK_QUERY_ERROR"""")
+  }
+
+  test(
+    "source-faithful runtime replaceable expression: the legacy phrase survives in the persisted " +
+      "record for downstream matching, but not in the operator log") {
+    // CheckAnalysis raises this exact failure for an unresolved RuntimeReplaceable via
+    // SparkException.internalError(...). It is a "should not happen" analyzer safety net that a live
+    // query cannot deterministically trigger, so this reproduces the construction faithfully (same
+    // type org.apache.spark.SparkException, same INTERNAL_ERROR class, same leading phrase); only
+    // the operand SQL text is a synthetic canary. Remaining gap: not provoked end to end by a query.
+    val operandCanary = "synthetic_fn(canary_operand_replaceable)"
+    val replaceable = SparkException.internalError(
+      "Cannot resolve the runtime replaceable expression '" + operandCanary + "'. " +
+        "The replacement is unresolved: 'canary_operand_replaceable'.")
+
+    // Customer / persisted message keeps the leading phrase downstream rules key on.
+    val customer = ErrorSanitizer.customerMessage(replaceable)
+    customer should include("Cannot resolve the runtime replaceable expression")
+    customer should not include "sqlState=["
+
+    // Operator log stays strict: the INTERNAL_ERROR class only, no message text.
+    ErrorSanitizer.operatorLogMessage(replaceable) shouldBe "[INTERNAL_ERROR]"
+
+    val json = persistedJson(replaceable)
+    // The persisted record carries the phrase under the real SparkException type, so the supplied
+    // downstream translation rule keeps matching.
+    val downstreamRule =
+      """.*Cannot resolve the runtime replaceable expression.*""".r
+    downstreamRule.findFirstIn(json) shouldBe defined
+    json should include(""""exception.type":"org.apache.spark.SparkException"""")
     json should include(""""errorCode":"SPARK_QUERY_ERROR"""")
   }
 
@@ -157,21 +220,20 @@ class ErrorSanitizerRealSparkTest
   test(
     "CustomLogging event map for a redacted real analysis exception carries no query canaries") {
     // End-to-end proof over the actual logging construction path: a real analysis failure is
-    // redacted exactly as the production catch site does, then handed to the real
-    // CustomLogging.constructLogEventMap. Every field the log event exposes -- body.message,
-    // exception.message, exception.type, and the rendered throwable (toString header + stack
-    // trace) -- is asserted free of any query-derived content. Coverage note: this asserts the
-    // fields constructLogEventMap populates and the throwable rendering log4j reads from; it does
-    // not assert the downstream appender/JSON serializer, which only re-serializes these fields.
+    // redacted exactly as the production catch site does (FlintREPL.redactThrowable -> the strict
+    // operatorLogMessage), then handed to the real CustomLogging.constructLogEventMap. Every field
+    // the log event exposes -- body.message, exception.message, exception.type, and the rendered
+    // throwable (toString header + stack trace) -- is asserted free of any query-derived content.
     spark.sql("SELECT 1 AS id, 'x' AS name").createOrReplaceTempView("real_probe_log")
     val column = "nonexistent_col_customlogging_8884"
     val analysis = failWith(s"SELECT $column FROM real_probe_log")
 
-    // Reproduce the production catch-site redaction exactly (FlintREPL.redactThrowable), including
-    // the "prefix: <sanitized>" message shape passed to CustomLogging.logError.
+    // Reproduce the production log catch-site redaction exactly, including the "prefix: <log>"
+    // message shape passed to CustomLogging.logError.
     val redacted = FlintREPL.redactThrowable(analysis)
-    val errorMessage = s"${ExceptionMessages.QueryAnalysisErrorPrefix}: ${redacted.getMessage}"
-    val logEventMap = constructLogEventMap(new OperationMessage(errorMessage, 400), redacted)
+    val logMessage =
+      s"${ExceptionMessages.QueryAnalysisErrorPrefix}: ${ErrorSanitizer.operatorLogMessage(analysis)}"
+    val logEventMap = constructLogEventMap(new OperationMessage(logMessage, 400), redacted)
 
     val body = logEventMap.get("body").asInstanceOf[java.util.Map[String, Object]]
     val attributes = logEventMap.get("attributes").asInstanceOf[java.util.Map[String, Object]]
@@ -184,7 +246,7 @@ class ErrorSanitizerRealSparkTest
     redacted.printStackTrace(new java.io.PrintWriter(sw))
     val rendered = sw.toString
 
-    // No query-derived content in any field the event exposes.
+    // No query-derived content in any field the log event exposes.
     Seq(bodyMessage, exceptionMessage, exceptionType, redacted.toString, rendered).foreach {
       field =>
         field should not include column
@@ -196,7 +258,7 @@ class ErrorSanitizerRealSparkTest
 
     // Positive contract: the surviving content is stable and non-customer.
     bodyMessage should include(ExceptionMessages.QueryAnalysisErrorPrefix)
-    exceptionMessage should include("UNRESOLVED_COLUMN") // errorClass-only sanitized message
+    exceptionMessage should include("UNRESOLVED_COLUMN") // errorClass-only log message
     exceptionType shouldBe "org.apache.spark.sql.exception.RedactedException"
     // The original exception type is still recoverable from the rendered header for debugging.
     redacted.toString should include("ExtendedAnalysisException")
@@ -204,15 +266,16 @@ class ErrorSanitizerRealSparkTest
 
   // --------------------------------------------------------------------------
   // Production JSON serializer coverage + table-driven real-exception canary
-  // matrix.
+  // matrix, scoped to the OPERATOR LOG path.
   //
-  // The tests above assert the intermediate field map. The tests below drive
-  // the exact string log4j receives -- CustomLogging.convertToJson applied to
-  // the map constructLogEventMap builds -- then parse that line and recursively
-  // scan every leaf value, so a canary that survived only after JSON escaping
-  // (a CRLF or Unicode canary) is still caught. The matrix provokes a broad set
-  // of real Spark 3.5.1 failures and routes each through the sanitizer, the
-  // full FlintREPL.processQueryException sink, and the production serializer.
+  // The customer / persisted message intentionally retains the actionable
+  // diagnostic (which can include the offending identifier), so the invariant
+  // proven here is the strict one: the operator log message and the exact
+  // string log4j receives never carry query-derived content. The tests drive
+  // CustomLogging.convertToJson applied to the map constructLogEventMap builds
+  // for the redacted throwable, then parse that line and recursively scan every
+  // leaf value, so a canary that survived only after JSON escaping (a CRLF or
+  // Unicode canary) is still caught.
   // --------------------------------------------------------------------------
 
   private val jsonMapper = new ObjectMapper()
@@ -260,11 +323,13 @@ class ErrorSanitizerRealSparkTest
     }
   }
 
-  // A sanitized Spark-native message must be exactly the bracketed errorClass
-  // token (optionally followed by sqlState) that downstream consumers key on.
-  private val bracketedErrorClass = "^\\[[A-Z0-9_.]+\\]( sqlState=\\[[^\\]]+\\])?$".r
+  // A strict operator-log message for a Spark-native failure is exactly the
+  // bracketed errorClass token, optionally followed by a safe cause class name.
+  private val bracketedErrorClass =
+    "^\\[[A-Z0-9_.]+\\]( cause=\\[[^\\]]+\\])?$".r
 
-  test("production JSON serializer emits no query content for a real analysis failure") {
+  test(
+    "production JSON serializer emits no query content in the operator log for an analysis failure") {
     spark.sql("SELECT 1 AS id, 'x' AS name").createOrReplaceTempView("real_serializer_probe")
     val column = "nonexistent_col_serializer_9099"
     val root = failWith(s"SELECT $column FROM real_serializer_probe")
@@ -376,7 +441,7 @@ class ErrorSanitizerRealSparkTest
       Seq("_canary_long_9015")))
 
   matrixCases.foreach { c =>
-    test(s"canary matrix: ${c.name}") {
+    test(s"canary matrix (operator log): ${c.name}") {
       spark.sql("SELECT 1 AS id, 'x' AS name").createOrReplaceTempView("real_matrix_vals")
       c.setup()
 
@@ -389,10 +454,9 @@ class ErrorSanitizerRealSparkTest
           failWith(c.sql)
         }
 
-      // Precondition: the raw failure really carries the canary, so redaction is
-      // proven rather than trivially satisfied. The executor-regex case is a
-      // negative control -- its query text never reaches the pattern exception --
-      // so it opts out of this precondition.
+      // Precondition: the raw failure really carries the canary, so redaction is proven rather than
+      // trivially satisfied. The executor-regex case is a negative control -- its query text never
+      // reaches the pattern exception -- so it opts out of this precondition.
       if (c.expectCanaryInRaw) {
         val raw = Option(root.getMessage).getOrElse("")
         withClue(s"raw message did not contain any canary: $raw\n") {
@@ -400,23 +464,20 @@ class ErrorSanitizerRealSparkTest
         }
       }
 
-      // (1) sanitized message carries no canary ...
-      val sanitized = ErrorSanitizer.sanitizedMessage(root)
-      assertNoCanary("sanitized", sanitized, c.canaries)
+      // (1) the strict operator-log message carries no canary ...
+      val log = ErrorSanitizer.operatorLogMessage(root)
+      assertNoCanary("operatorLogMessage", log, c.canaries)
 
-      // ... and for a Spark-native failure it is exactly the bracketed errorClass
-      // token (plus optional sqlState) preserved for downstream classification.
+      // ... and for a Spark-native failure it is exactly the bracketed errorClass token (plus an
+      // optional safe cause class name).
       if (c.sparkThrowable) {
-        withClue(s"sanitized message was not a bare errorClass token: $sanitized\n") {
-          bracketedErrorClass.pattern.matcher(sanitized).matches() shouldBe true
+        withClue(s"operator log message was not a bare errorClass token: $log\n") {
+          bracketedErrorClass.pattern.matcher(log).matches() shouldBe true
         }
       }
 
-      // (2) full persisted error JSON, scanned recursively.
-      assertJsonHasNoCanary("persistedJson", persistedJson(root), c.canaries)
-
-      // (3) exact production log line for the redacted throwable, scanned
-      // recursively across body.message, exception.message/type, and attributes.
+      // (2) the exact production log line for the redacted throwable, scanned recursively across
+      // body.message, exception.message/type, and attributes.
       val redacted = FlintREPL.redactThrowable(root)
       val logLine = productionLogLine(new OperationMessage(redacted.getMessage, 400), redacted)
       assertJsonHasNoCanary("productionLogLine", logLine, c.canaries)
