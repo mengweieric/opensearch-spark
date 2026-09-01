@@ -455,29 +455,13 @@ trait FlintJobExecutor {
       CleanerFactory.cleaner(streaming))
   }
 
-  /**
-   * The message persisted to the query result store and forwarded downstream. Keeps the
-   * actionable single-line diagnostic while dropping the query itself (logical plan, `== SQL ==`
-   * block, and any following multi-line context). Delegates to [[ErrorSanitizer]], which holds
-   * one policy per exception family plus a fail-closed fallback.
-   */
+  /** Persisted/forwarded message. See [[ErrorSanitizer.customerMessage]]. */
   private[sql] def customerMessage(t: Throwable): String = ErrorSanitizer.customerMessage(t)
 
-  /**
-   * The message written to the driver logs, redacted to the stable classification only (catalog
-   * `errorClass`, or a bare label plus a safe cause class name for a generic Spark failure).
-   * Never carries message text, query context, or a logical plan.
-   */
+  /** Driver-log message. See [[ErrorSanitizer.operatorLogMessage]]. */
   private[sql] def operatorLogMessage(t: Throwable): String = ErrorSanitizer.operatorLogMessage(t)
 
-  /**
-   * Wraps a throwable so that only its [[operatorLogMessage]] is ever exposed (via getMessage /
-   * toString), while preserving the original exception type name and stack trace for debugging.
-   * This is the redaction point for the driver logs: the wrapper is passed to CustomLogging so
-   * customer query content cannot leak through either the `exception.message` attribute or the
-   * log4j stack trace. The persisted/forwarded error string is built separately from
-   * [[customerMessage]].
-   */
+  /** Log-safe throwable wrapper. See [[ErrorSanitizer.redactThrowable]]. */
   private[sql] def redactThrowable(t: Throwable): Throwable = ErrorSanitizer.redactThrowable(t)
 
   private def handleQueryException(
@@ -485,52 +469,27 @@ trait FlintJobExecutor {
       messagePrefix: String,
       errorSource: Option[String] = None,
       statusCode: Option[Int] = None,
-      // The throwable whose type and cause chain drive the operator-log redaction.
-      // processQueryException unwraps to the root cause (`t`) for classification, the customer
-      // message, and the persisted exception.type, but the operator log must see the original
-      // wrapper so a Spark wrapper (e.g. a task-failure SparkException around a
-      // PatternSyntaxException) routes to the strict label instead of the raw first-line floor.
-      // Defaults to `t` when the caller has no distinct wrapper, or intentionally substitutes a
-      // curated throwable (as the Glue / metastore access-denied paths do).
+      // Wrapper used for strict operator classification; defaults to the persisted root cause.
       originalThrowable: Throwable = null): String = {
     throwableHandler.setThrowable(t)
 
-    // The throwable that drives the operator-log channel. Its cause chain still includes any
-    // enclosing wrapper, which the root-cause `t` cannot, so the log stays strict for wrapped
-    // failures instead of falling through to the first-line floor.
+    // Keep wrappers so a task-failure SparkException cannot fall through to a raw-message floor.
     val logThrowable = if (originalThrowable == null) t else originalThrowable
 
-    // Two audiences, two messages. The persisted / forwarded record (-> query result store and
-    // downstream consumers) keeps the actionable single-line diagnostic so customers can act on the
-    // failure and legacy message-matching consumers still work. The driver log stays strictly
-    // redacted to the stable classification. Both drop the query itself (plan, `== SQL ==` block,
-    // multi-line context); neither appends a SQL state.
+    // Persist one actionable line; log only strict operator-safe classification and templates.
     val persistedMessage = s"$messagePrefix: ${customerMessage(t)}"
     val logMessage = s"$messagePrefix: ${operatorLogMessage(logThrowable)}"
-    // The throwable handed to CustomLogging exposes only the strict operator-log message via
-    // getMessage / toString / stack-trace header, so nothing leaks through the logged exception.
     val logSafeThrowable = redactThrowable(logThrowable)
-    // Classification is derived from typed fields, independently of the messages above, so
-    // consumers can classify a failure without pattern-matching text that redaction may rewrite.
     val classification = ErrorSanitizer.classify(t)
-    // One effective status for both the persisted JSON and the CustomLogging call below. Prefer an
-    // explicitly supplied status (already read off a typed AWS exception at the call site);
-    // otherwise fall back to whatever the classification recovered from a typed field. Computing it
-    // once keeps the forwarded record and the log line from disagreeing.
+    // Compute one status so persisted and operator records agree.
     val effectiveStatusCode: Option[Int] = statusCode.orElse(classification.statusCode)
     val errorDetails = new java.util.LinkedHashMap[String, String]()
     errorDetails.put("message", persistedMessage)
     errorSource.foreach(es => errorDetails.put("ErrorSource", es))
     effectiveStatusCode.foreach(code => errorDetails.put("statusCode", code.toString))
     errorDetails.put("errorCode", classification.errorCode)
-    // Temporary downstream rollout compatibility. OpenSearch bulk-write failures previously reached
-    // the wire as bare java.lang.RuntimeExceptions, and some error translations match on that exact
-    // exception.type plus a security/authorization token in the message. Emitting the new concrete
-    // class name here would silently bypass those translations. We therefore keep the
-    // RuntimeException supertype name on the wire (the class genuinely extends it) while the
-    // structured errorCode/statusCode fields above become the durable contract. Remove this shim
-    // once downstream consumers classify on those fields; the canonical authorization token is
-    // asserted by the legacy wire-contract test in FlintREPLTest.
+    // Compatibility shim: legacy authorization rules require RuntimeException plus the canonical
+    // message token. Remove after downstream consumers use errorCode/statusCode.
     val persistedExceptionType = t match {
       case _: OpenSearchBulkWriteException => classOf[RuntimeException].getName
       case _ => t.getClass.getName
@@ -538,17 +497,17 @@ trait FlintJobExecutor {
     errorDetails.put("exception.type", persistedExceptionType)
 
     val errorJson = mapper.writeValueAsString(errorDetails)
-    // Record the processed error message
     throwableHandler.setError(errorJson)
-    // CustomLogging will call log4j logger.error() underneath. Pass the redacted throwable and the
-    // strict operator-log message so the logical plan and diagnostic text do not leak via the
-    // logged exception message or stack trace.
-    effectiveStatusCode match {
-      case Some(code) =>
-        CustomLogging.logError(new OperationMessage(logMessage, code), logSafeThrowable)
-      case None =>
-        CustomLogging.logError(logMessage, logSafeThrowable)
-    }
+
+    val operatorContext = ErrorSanitizer.operatorLogContext(logThrowable)
+    val operationMessage = new OperationMessage(
+      logMessage,
+      effectiveStatusCode.map(Int.box).orNull,
+      classification.errorCode,
+      logThrowable.getClass.getName,
+      operatorContext.requestId.orNull,
+      operatorContext.extendedRequestId.orNull)
+    CustomLogging.logError(operationMessage, logSafeThrowable)
 
     errorJson
   }

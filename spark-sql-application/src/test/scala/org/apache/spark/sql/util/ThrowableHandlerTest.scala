@@ -5,6 +5,7 @@
 
 package org.apache.spark.sql.util
 
+import com.amazonaws.services.s3.model.AmazonS3Exception
 import org.scalatest.matchers.should.Matchers
 
 import org.apache.spark.{SparkException, SparkFunSuite, SparkThrowable}
@@ -37,6 +38,26 @@ class ThrowableHandlerTest extends SparkFunSuite with Matchers {
     handler.error shouldBe persisted
     handler.exceptionThrown shouldBe Some(original)
     handler.hasException shouldBe true
+  }
+
+  test("operatorLogEvent carries typed classification and AWS correlation context") {
+    val handler = new ThrowableHandler()
+    val original = new AmazonS3Exception("customer-bucket/customer-key")
+    original.setServiceName("Amazon S3")
+    original.setStatusCode(403)
+    original.setErrorCode("AccessDenied")
+    original.setRequestId("request-123")
+    original.setExtendedRequestId("extended-request-456")
+
+    val (event, redacted) = handler.operatorLogEvent("Fail to read data", original)
+
+    event.getStatusCode shouldBe 403
+    event.getErrorCode shouldBe "S3_ERROR"
+    event.getExceptionType shouldBe classOf[AmazonS3Exception].getName
+    event.getRequestId shouldBe "request-123"
+    event.getExtendedRequestId shouldBe "extended-request-456"
+    event.getFormattedMessage should not include "customer-bucket"
+    redacted.getMessage should not include "customer-key"
   }
 
   test(

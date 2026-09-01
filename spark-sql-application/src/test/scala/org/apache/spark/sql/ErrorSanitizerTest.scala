@@ -117,6 +117,30 @@ class ErrorSanitizerTest extends SparkFunSuite with Matchers {
     classification.statusCode shouldBe Some(400)
   }
 
+  test("operator logging keeps typed Glue service context and drops the raw message") {
+    val glue = new AWSGlueException("customer_table_CANARY")
+    glue.setServiceName("AWSGlue")
+    glue.setStatusCode(500)
+    glue.setErrorCode("InternalServiceException")
+
+    val message = ErrorSanitizer.operatorLogMessage(glue)
+
+    message shouldBe
+      "serviceName=[AWSGlue], statusCode=[500], errorCode=[InternalServiceException]"
+    message should not include "customer_table_CANARY"
+  }
+
+  test("operatorLogContext returns typed AWS request identifiers") {
+    val s3 = new AmazonS3Exception("customer-bucket_CANARY")
+    s3.setRequestId("request-123")
+    s3.setExtendedRequestId("extended-request-456")
+
+    val context = ErrorSanitizer.operatorLogContext(new SparkException("wrapper", s3))
+
+    context.requestId shouldBe Some("request-123")
+    context.extendedRequestId shouldBe Some("extended-request-456")
+  }
+
   test("classify maps a SparkThrowable that is not a query exception to a spark query error") {
     val e = new RuntimeException("boom") with SparkThrowable {
       override def getErrorClass: String = "SOME_SPARK_ERROR"

@@ -48,6 +48,18 @@ class ErrorSanitizerRealSparkTest
   private def persistedJson(t: Throwable): String =
     FlintREPL.processQueryException(t, mock[FlintStatement])
 
+  private def operationMessage(message: String, t: Throwable): OperationMessage = {
+    val classification = ErrorSanitizer.classify(t)
+    val context = ErrorSanitizer.operatorLogContext(t)
+    new OperationMessage(
+      message,
+      classification.statusCode.map(Int.box).orNull,
+      classification.errorCode,
+      t.getClass.getName,
+      context.requestId.orNull,
+      context.extendedRequestId.orNull)
+  }
+
   /**
    * Invokes the real production [[CustomLogging.constructLogEventMap]] (the deterministic method
    * that assembles every field a log event carries, including `body.message`, `exception.type`,
@@ -251,7 +263,7 @@ class ErrorSanitizerRealSparkTest
     val redacted = FlintREPL.redactThrowable(analysis)
     val logMessage =
       s"${ExceptionMessages.QueryAnalysisErrorPrefix}: ${ErrorSanitizer.operatorLogMessage(analysis)}"
-    val logEventMap = constructLogEventMap(new OperationMessage(logMessage, 400), redacted)
+    val logEventMap = constructLogEventMap(operationMessage(logMessage, analysis), redacted)
 
     val body = logEventMap.get("body").asInstanceOf[java.util.Map[String, Object]]
     val attributes = logEventMap.get("attributes").asInstanceOf[java.util.Map[String, Object]]
@@ -281,8 +293,9 @@ class ErrorSanitizerRealSparkTest
       "UNRESOLVED_COLUMN"
     ) // errorClass + static template log message
     exceptionMessage should include("<objectName>") // static placeholder retained, no value
-    exceptionType shouldBe "org.apache.spark.sql.exception.RedactedException"
-    // The original exception type is still recoverable from the rendered header for debugging.
+    exceptionType shouldBe analysis.getClass.getName
+    body.get("errorCode") shouldBe ErrorCode.QueryAnalysisError
+    // The rendered throwable also retains the original type for debugging.
     redacted.toString should include("ExtendedAnalysisException")
   }
 
@@ -361,7 +374,7 @@ class ErrorSanitizerRealSparkTest
     val root = failWith(s"SELECT $column FROM real_serializer_probe")
     val redacted = FlintREPL.redactThrowable(root)
 
-    val logLine = productionLogLine(new OperationMessage(redacted.getMessage, 400), redacted)
+    val logLine = productionLogLine(operationMessage(redacted.getMessage, root), redacted)
 
     // The emitted line parses as JSON and no leaf value carries query content.
     assertJsonHasNoCanary(
@@ -371,8 +384,8 @@ class ErrorSanitizerRealSparkTest
 
     // Positive contract: the OTEL envelope and stable tokens survive.
     val tree = jsonMapper.readTree(logLine)
-    tree.at("/attributes/exception.type").asText() shouldBe
-      "org.apache.spark.sql.exception.RedactedException"
+    tree.at("/attributes/exception.type").asText() shouldBe root.getClass.getName
+    tree.at("/body/errorCode").asText() shouldBe ErrorCode.QueryAnalysisError
     leafValues(tree).exists(_.contains("UNRESOLVED_COLUMN")) shouldBe true
   }
 
@@ -505,7 +518,7 @@ class ErrorSanitizerRealSparkTest
       // (2) the exact production log line for the redacted throwable, scanned recursively across
       // body.message, exception.message/type, and attributes.
       val redacted = FlintREPL.redactThrowable(root)
-      val logLine = productionLogLine(new OperationMessage(redacted.getMessage, 400), redacted)
+      val logLine = productionLogLine(operationMessage(redacted.getMessage, root), redacted)
       assertJsonHasNoCanary("productionLogLine", logLine, c.canaries)
     }
   }

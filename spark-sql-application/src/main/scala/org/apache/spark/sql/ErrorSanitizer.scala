@@ -19,39 +19,11 @@ import org.apache.spark.sql.catalyst.parser.ParseException
 import org.apache.spark.sql.exception.RedactedException
 
 /**
- * Centralized policy for turning a throwable into (a) a message, and (b) a machine-readable
- * classification that does not depend on that message's wording.
- *
- * Rationale for splitting message from classification: an error string that is simultaneously the
- * human-readable diagnostic and the classification protocol cannot be changed safely. Redacting
- * it for compliance alters the classification; preserving it for classification blocks redaction.
- * Emitting [[classify]] alongside the message lets the message be shaped for its audience while
- * the classification stays stable.
- *
- * There are two message audiences, and they get different policies because they have different
- * risk profiles:
- *
- *   - [[customerMessage]] is what is persisted to the query result store and forwarded
- *     downstream. Customers need actionable diagnostics, so this keeps the useful single-line
- *     message (the offending identifier, the "Did you mean" suggestion, the parser detail, the
- *     first-line runtime diagnostic) while dropping the parts that echo the query itself: the
- *     appended logical plan tree, the `== SQL ==` block, and any following multi-line query
- *     context. It never appends a SQL state code.
- *   - [[operatorLogMessage]] is what reaches the driver logs. Logs are broadly readable, so this
- *     stays strict: it never surfaces `getSimpleMessage`, an interpolated message, message
- *     parameter values, query context, or a logical plan. It keeps the maximum diagnostic detail
- *     that is provably not customer-derived: the stable, catalog-derived `errorClass`; the static
- *     message *template* for that class, taken from Spark's error-conditions catalog with its
- *     `<param>` placeholders left un-interpolated so no parameter value is ever substituted in;
- *     and a bounded, safe cause class name. For a generic failure with no `errorClass` it emits
- *     the bare `[SPARK_ERROR]` label plus that cause class. It never appends a SQL state code.
- *     The one bounded read of `getMessage` is [[platformClassTokenFromMessage]], used only when
- *     no structured cause exists, which extracts only an allowlisted platform class token (never
- *     the surrounding text) as a last-resort cause handle.
- *
- * Policies are per exception family because there is no single textual rule that is safe for
- * every message. Anything unrecognized falls back to the most conservative option that does not
- * regress the currently shipped behavior.
+ * Shapes error information independently for persisted customer records, operator logs, and
+ * machine-readable classification. Customer records keep one actionable, plan-free line. Operator
+ * logs keep only typed fields, static Spark templates, and bounded cause categories.
+ * Classification comes from typed fields and remains stable when either message changes. See each
+ * public method for its per-family policy.
  */
 object ErrorSanitizer extends Logging {
 
@@ -86,19 +58,20 @@ object ErrorSanitizer extends Logging {
    */
   private val MaxTemplateLength = 1024
 
+  /** Fixed platform classes recoverable from a generic Spark stage-failure message. */
+  private val SafeMessageCauseClassNames = Set(
+    "java.lang.OutOfMemoryError",
+    "java.lang.StackOverflowError",
+    "java.util.regex.PatternSyntaxException",
+    "org.apache.spark.shuffle.FetchFailedException")
+
   /**
-   * Fully-qualified class tokens that are safe to surface in the operator log because their
-   * package belongs to the platform, not to customer or application code. Used only to recover a
-   * cause class name from message text when no structured cause is available. Each alternative is
-   * matched as a package prefix (it must be followed by a `.` and cannot be embedded inside
-   * another qualified identifier), the token must end in a segment terminating in `Exception` or
-   * `Error`, and only the token itself is ever emitted -- never the surrounding text. An
-   * arbitrary customer or application package token does not match and is therefore rejected.
+   * Captures the first exception class in Spark's generated `Lost task ... executor ...:` frame.
    */
-  private val PlatformExceptionClassPattern =
-    ("(?<![A-Za-z0-9_$.])(?:javax|java|scala|org\\.apache\\.spark|org\\.opensearch)" +
-      "(?:\\.[A-Za-z_$][A-Za-z0-9_$]*)*" +
-      "\\.[A-Za-z_$][A-Za-z0-9_$]*(?:Exception|Error)").r
+  private val StageFailureCausePattern =
+    ("(?s)\\bLost task\\b.*?\\):\\s*" +
+      "([A-Za-z_$][A-Za-z0-9_$]*(?:\\.[A-Za-z_$][A-Za-z0-9_$]*)+" +
+      "\\.[A-Za-z_$][A-Za-z0-9_$]*(?:Exception|Error))(?=:)").r
 
   /**
    * Closed vocabulary of error codes. A fixed enumeration is what makes this channel trustworthy:
@@ -129,6 +102,29 @@ object ErrorSanitizer extends Logging {
    *   reintroduce the coupling this class exists to remove.
    */
   case class ErrorClassification(errorCode: String, statusCode: Option[Int])
+
+  /** Service-generated correlation identifiers safe to include in operator logs. */
+  private[sql] case class OperatorLogContext(
+      requestId: Option[String],
+      extendedRequestId: Option[String])
+
+  private[sql] def operatorLogContext(t: Throwable): OperatorLogContext = try {
+    val chain = causeChain(t)
+    val requestId =
+      chain.collectFirst { case ase: AmazonServiceException => ase }.flatMap { ase =>
+        safeNonEmpty(ase.getRequestId)
+      }
+    val extendedRequestId = chain.collectFirst { case s3: AmazonS3Exception => s3 }.flatMap {
+      s3 => safeNonEmpty(s3.getExtendedRequestId)
+    }
+    OperatorLogContext(requestId, extendedRequestId)
+  } catch {
+    case NonFatal(_) => OperatorLogContext(None, None)
+  }
+
+  private def safeNonEmpty(value: => String): Option[String] =
+    try Option(value).filter(_.nonEmpty)
+    catch { case NonFatal(_) => None }
 
   /**
    * Classifies a throwable using typed fields only. Callers are expected to have unwrapped to the
@@ -201,32 +197,10 @@ object ErrorSanitizer extends Logging {
   }
 
   /**
-   * Returns the message persisted to the query result store and forwarded downstream, with the
-   * query itself removed but the actionable diagnostic kept.
-   *
-   * Per-family policy:
-   *   - [[AnalysisException]] (including `ExtendedAnalysisException` and [[ParseException]]): the
-   *     first line of `getSimpleMessage`. `getSimpleMessage` is Spark's own "message without the
-   *     logical plan", and for a [[ParseException]] it also excludes the appended `== SQL ==`
-   *     block (both live only in `getMessage`). Taking the first line additionally drops any
-   *     trailing multi-line query context. What remains is the diagnostic a customer needs: the
-   *     offending identifier, the "Did you mean" suggestion, and the parser detail. No SQL state
-   *     is appended.
-   *   - Any other [[SparkThrowable]] (e.g. a `SparkException` internal error, an ANSI runtime
-   *     failure): the first line of the rendered message. This preserves the leading diagnostic
-   *     that some downstream consumers still classify on (for example the "Cannot resolve the
-   *     runtime replaceable expression ..." phrase) while dropping the appended `== SQL ==` query
-   *     fragment and any following context, which live below the first line. No SQL state is
-   *     appended.
-   *   - [[OpenSearchBulkWriteException]]: its own message, which is assembled from structured
-   *     fields and never includes per-item failure text.
-   *   - [[AmazonS3Exception]]: structured service/status/error-code fields rather than the raw
-   *     message, which can embed customer bucket and key names.
-   *   - Anything else, including other AWS exceptions: the first line only. Their message is
-   *     frequently an already-curated, safe sentence (`processQueryException` replaces a Glue
-   *     access-denied message with an actionable explanation), and reducing it to a code would
-   *     discard that. This is a floor, not a guarantee, since a single-line message can still
-   *     carry customer values; broadening redaction there is a separate, reviewed change.
+   * Returns the persisted/forwarded diagnostic. Analysis and parse failures use the first line of
+   * `getSimpleMessage`; other Spark failures use the first rendered line. OpenSearch bulk and S3
+   * failures use typed structured fields. Other families retain the existing first-line floor for
+   * compatibility. No path appends SQL state, plans, SQL blocks, or following multiline context.
    */
   def customerMessage(t: Throwable): String = try {
     customerPolicyMessage(t)
@@ -241,28 +215,10 @@ object ErrorSanitizer extends Logging {
   }
 
   /**
-   * Returns the message written to the driver logs, redacted to the stable classification only.
-   * The whole cause chain is inspected so an enclosing wrapper cannot hide the failure it
-   * carries: `processQueryException` unwraps to the root cause for the customer message and
-   * classification, but hands the original throwable here so a wrapper (for example a
-   * task-failure `SparkException` around a non-Spark cause) still routes to the strict label
-   * instead of the raw first-line floor.
-   *
-   * Resolution order over the chain:
-   *   - The structured fields of the first [[OpenSearchBulkWriteException]] or
-   *     [[AmazonS3Exception]] found, assembled from typed fields and carrying no query content.
-   *   - Otherwise, if anything in the chain is a [[SparkThrowable]] (including
-   *     [[AnalysisException]], `ExtendedAnalysisException`, and [[ParseException]]): a bracketed
-   *     catalog `errorClass` when present, followed by that class's static catalog message
-   *     template (placeholders left un-interpolated, carrying no parameter value), otherwise the
-   *     bare `[SPARK_ERROR]` label. In either case a single bounded and safe cause class name is
-   *     appended as `cause=[...]` when one is available. That cause name is taken from the
-   *     structured immediate cause, or, only for a generic failure with no `errorClass` and no
-   *     structured cause, from an allowlisted platform class token in the message text; no other
-   *     message content is ever read.
-   *   - Otherwise, for a chain with no recognized type, a bare [[UnknownErrorLabel]] plus the
-   *     deepest cause's bounded, safe class name ([[unrecognizedThrowableLogLabel]]). No message
-   *     text is read, so the customer-derived first line the shipped floor logged never appears.
+   * Returns the strict driver-log message. Typed OpenSearch/AWS fields win first. Spark failures
+   * use the catalog `errorClass`, un-interpolated template, and at most one bounded cause class.
+   * A generic no-cause Spark failure may recover only a fixed diagnostic class from message text.
+   * Unrecognized failures emit [[UnknownErrorLabel]] plus the deepest bounded class name.
    */
   def operatorLogMessage(t: Throwable): String = try {
     operatorPolicyMessage(t)
@@ -312,6 +268,7 @@ object ErrorSanitizer extends Logging {
       .collectFirst {
         case be: OpenSearchBulkWriteException => openSearchBulkWriteMessage(be)
         case s3: AmazonS3Exception => s3StructuredMessage(s3)
+        case ase: AmazonServiceException => amazonServiceStructuredMessage(ase)
       }
       .orElse {
         if (chain.exists(_.isInstanceOf[SparkThrowable])) Some(sparkThrowableLogLabel(t))
@@ -343,6 +300,14 @@ object ErrorSanitizer extends Logging {
   private def s3StructuredMessage(s3: AmazonS3Exception): String =
     s"serviceName=[${s3.getServiceName}], statusCode=[${s3.getStatusCode}], " +
       s"errorCode=[${s3.getErrorCode}]"
+
+  private def amazonServiceStructuredMessage(ase: AmazonServiceException): String = {
+    val fields = Seq(
+      safeNonEmpty(ase.getServiceName).map(value => s"serviceName=[$value]"),
+      Some(s"statusCode=[${ase.getStatusCode}]"),
+      safeNonEmpty(ase.getErrorCode).map(value => s"errorCode=[$value]"))
+    fields.flatten.mkString(", ")
+  }
 
   /**
    * Returns the safe structured bulk-write message plus a temporary, canonical compatibility
@@ -462,22 +427,19 @@ object ErrorSanitizer extends Logging {
     else name.substring(0, MaxCauseClassNameLength)
 
   /**
-   * A best-effort, strictly-bounded platform exception class token recovered from a throwable's
-   * message text, used only as a fallback when no structured cause class is available -- the
-   * review case where a generic `SparkException` names the underlying platform exception only in
-   * its message. This is the single place the operator-log channel reads `getMessage`, and it
-   * never emits surrounding text: it returns only a fully-qualified class token that begins with
-   * an allowlisted platform package prefix, ends in `Exception`/`Error`, and is bounded to
-   * [[MaxCauseClassNameLength]] characters (see [[PlatformExceptionClassPattern]]). `getMessage`
-   * is read under a guard so a hostile override cannot propagate a secondary failure, and an
-   * arbitrary customer or application package token is rejected because it does not match the
-   * allowlist. Returns None when nothing matches, which is the common case.
+   * Recovers a fixed diagnostic class from Spark's generated DAGScheduler task-failure frame when
+   * no structured cause exists. Only the first framed exception class is considered, so customer
+   * message text cannot supply a later match.
    */
   private def platformClassTokenFromMessage(t: Throwable): Option[String] = {
     val message =
       try Option(t.getMessage).getOrElse("")
       catch { case NonFatal(_) => "" }
-    PlatformExceptionClassPattern.findFirstIn(message).map(boundName)
+    StageFailureCausePattern
+      .findFirstMatchIn(message)
+      .map(_.group(1))
+      .filter(SafeMessageCauseClassNames.contains)
+      .map(boundName)
   }
 
   private def firstLine(message: String): String =

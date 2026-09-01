@@ -1233,7 +1233,9 @@ class FlintREPLTest
     // its message text (no structured cause). The strict label recovers just the allowlisted class
     // token; the surrounding message -- including the trailing detail -- is never emitted.
     val wrapper = new SparkException(
-      "Job failed: java.util.regex.PatternSyntaxException: Unclosed group near index 4 detail_CANARY")
+      "Job aborted due to stage failure\n" +
+        "Lost task 1.0 in stage 2.0 (TID 3) (executor 4): " +
+        "java.util.regex.PatternSyntaxException: Unclosed group detail_CANARY")
 
     val log = FlintREPL.operatorLogMessage(wrapper)
     log shouldBe "[SPARK_ERROR] cause=[java.util.regex.PatternSyntaxException]"
@@ -1253,6 +1255,27 @@ class FlintREPLTest
     log should not include "com.customer"
     log should not include "java.util.SecretLeakException"
     log should not include "sensitive_detail_CANARY"
+  }
+
+  test("operatorLogMessage handles the multi-line DAGScheduler review case") {
+    val wrapper = new SparkException(
+      "Job aborted due to stage failure: Task 6 failed\n" +
+        "Lost task 6.3 (executor 1):\n" +
+        "java.util.regex.PatternSyntaxException: Illegal character range detail_CANARY")
+
+    val log = FlintREPL.operatorLogMessage(wrapper)
+    log shouldBe "[SPARK_ERROR] cause=[java.util.regex.PatternSyntaxException]"
+    log should not include "Illegal character range"
+    log should not include "detail_CANARY"
+  }
+
+  test("operatorLogMessage does not scan customer detail after the framed exception class") {
+    val wrapper = new SparkException(
+      "Job aborted due to stage failure\n" +
+        "Lost task 1.0 in stage 2.0 (TID 3) (executor 4): " +
+        "com.customer.BoomException: customer value java.util.regex.PatternSyntaxException")
+
+    FlintREPL.operatorLogMessage(wrapper) shouldBe "[SPARK_ERROR]"
   }
 
   test("Doc Exists and excludeJobIds is an ArrayList Containing JobId") {
